@@ -122,6 +122,9 @@ def trendyol_veri_cek(url):
 
 # --- PAZAR ANALİZİ ENGINE (ALGORİTMALAR) ---
 def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
+    fiyat = fiyat or 0.0
+    toplam_satis = toplam_satis or 0
+    
     # 1. Aylık Tahmini Satış & Ciro (Son duruma göre 30 günlük projeksiyon)
     aylik_tahmini_satis = max(toplam_satis * 4, 0) if toplam_satis > 0 else 0
     aylik_tahmini_ciro = aylik_tahmini_satis * fiyat
@@ -129,19 +132,16 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     # 2. Pazara Giriş Risk Skoru (1 - 100 Arası)
     risk_puan = 50  # Başlangıç nötr skor
     
-    # Satış ivmesine göre risk düşürme/artırma
     if toplam_satis > 15:
         risk_puan -= 20  # Yüksek talep var, risk düşük
     elif toplam_satis == 0:
         risk_puan += 15  # Satış hareketsiz, risk yüksek
         
-    # Fiyat marjı analizi
     if fiyat < 100:
         risk_puan += 10  # Düşük kar marjı potansiyeli
     elif fiyat > 500:
         risk_puan -= 10  # Yüksek ciro potansiyeli
 
-    # Stok bulunurluğu riski
     if stok is not None and stok == 0:
         risk_puan += 20  # Stok tükenmiş/Tedarik riski
 
@@ -200,7 +200,7 @@ HTML_TEMPLATE = '''
 <body>
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
-            <span class="navbar-brand mb-0 h1"><i class="fa-solid me-2"></i>Trendyol Pazar Analizi & Stok Takip SaaS</span>
+            <span class="navbar-brand mb-0 h1"><i class="fa-solid fa-chart-pie me-2"></i>Trendyol Pazar Analizi & Stok Takip SaaS</span>
             <a href="/tarat" class="btn btn-light btn-sm fw-bold text-dark"><i class="fa-solid fa-arrows-rotate me-1"></i> Tümünü Taramayı Tetikle</a>
         </div>
     </nav>
@@ -241,11 +241,11 @@ HTML_TEMPLATE = '''
                         <div class="row text-center">
                             <div class="col-6">
                                 <div class="metric-title">Tespit Satış</div>
-                                <div class="metric-value text-warning">{{ u.toplam_satis }} adet</div>
+                                <div class="metric-value text-warning">{{ u.satis }} adet</div>
                             </div>
                             <div class="col-6">
                                 <div class="metric-title">Gerçek Ciro</div>
-                                <div class="metric-value text-primary">{{ "{:,.2f}".format(u.toplam_ciro) }} TL</div>
+                                <div class="metric-value text-primary">{{ "{:,.2f}".format(u.ciro) }} TL</div>
                             </div>
                         </div>
                     </div>
@@ -300,7 +300,14 @@ def index():
     urunler = []
     for r in rows:
         u = dict(r)
-        u['analiz'] = pazar_analizi_hesapla(u['toplam_satis'], u['fiyat'], u['son_stok'])
+        
+        # Veritabanı sütun isimlerine karşı güvenli okuma
+        satis = u.get('toplam_satis') if u.get('toplam_satis') is not None else u.get('toplam_satis', 0)
+        ciro = u.get('toplam_ciro') if u.get('toplam_ciro') is not None else u.get('toplam_ciro', 0.0)
+        
+        u['satis'] = satis or 0
+        u['ciro'] = ciro or 0.0
+        u['analiz'] = pazar_analizi_hesapla(u['satis'], u['fiyat'], u['son_stok'])
         urunler.append(u)
         
     conn.close()
@@ -333,16 +340,20 @@ def tarat():
     cursor.execute("SELECT * FROM urunler")
     urunler = cursor.fetchall()
 
-    for u in urunler:
+    for r in urunler:
+        u = dict(r)
         yeni = trendyol_veri_cek(u['url'])
+        
+        toplam_satis = u.get('toplam_satis') if u.get('toplam_satis') is not None else u.get('toplam_satis', 0) or 0
+        toplam_ciro = u.get('toplam_ciro') if u.get('toplam_ciro') is not None else u.get('toplam_ciro', 0.0) or 0.0
+
         if yeni and yeni['stok'] is not None and u['son_stok'] is not None:
-            # Stok düştüyse satış gerçekleşmiştir
             if yeni['stok'] < u['son_stok']:
                 satis_adedi = u['son_stok'] - yeni['stok']
                 ek_ciro = satis_adedi * yeni['fiyat']
                 
-                yeni_toplam_satis = u['toplam_satis'] + satis_adedi
-                yeni_toplam_ciro = u['toplam_ciro'] + ek_ciro
+                yeni_toplam_satis = toplam_satis + satis_adedi
+                yeni_toplam_ciro = toplam_ciro + ek_ciro
                 
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 cursor.execute('''
@@ -352,7 +363,6 @@ def tarat():
                 ''', (yeni['fiyat'], yeni['stok'], yeni_toplam_satis, yeni_toplam_ciro, now, u['id']))
                 
                 conn.commit()
-                # E-posta Bildirimi
                 eposta_gonder(yeni['urun_adi'], yeni['fiyat'], yeni['stok'], satis_adedi, ek_ciro, u['url'])
             else:
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
