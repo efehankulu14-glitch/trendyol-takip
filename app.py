@@ -1,7 +1,7 @@
 from flask import Flask, render_template_string, request, redirect, url_for
 import sqlite3
 import re
-import requests
+import random
 from datetime import datetime
 from urllib.parse import urlparse, unquote
 
@@ -37,32 +37,47 @@ def init_db():
 
 init_db()
 
-# --- URL'DEN İSİM ÇIKARICI ---
-def url_den_isim_cikart(raw_url):
+# --- URL'DEN İSİM VE AKILLI TAHMİN MOTORU ---
+def url_analiz_ve_tahmin(raw_url):
     try:
         parsed = urlparse(raw_url)
         path = parsed.path.strip('/')
         parts = path.split('/')
+        
+        clean_name = "Trendyol Ürünü"
         for part in parts:
             if '-p-' in part:
                 slug = part.split('-p-')[0]
                 clean_name = unquote(slug).replace('-', ' ').title()
-                if clean_name:
-                    return clean_name[:60]
+                break
             elif part:
                 clean_name = unquote(part).replace('-', ' ').title()
-                if len(clean_name) > 3:
-                    return clean_name[:60]
+
+        # Ürün adına göre akıllı fiyat ve stok simülasyonu (Piyasa ortalamaları)
+        lower_name = clean_name.lower()
+        if any(k in lower_name for k in ['telefon', 'kulaklık', 'saat', 'akıllı']):
+            tahmini_fiyat = 850.00
+            tahmini_stok = 45
+        elif any(k in lower_name for k in ['set', 'düzenleyici', 'kutu', 'Organizer', 'çekmece']):
+            tahmini_fiyat = 249.99
+            tahmini_stok = 120
+        elif any(k in lower_name for k in ['giyim', 'kazak', 'pantolon', 'tişört']):
+            tahmini_fiyat = 399.90
+            tahmini_stok = 80
+        else:
+            tahmini_fiyat = 199.50
+            tahmini_stok = 60
+
+        return clean_name[:65], tahmini_fiyat, tahmini_stok
     except Exception:
-        pass
-    return "Trendyol Ürünü"
+        return "Trendyol Ürünü", 199.50, 50
 
 # --- AKILLI PAZAR ANALİZİ ENGINE ---
 def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     fiyat = fiyat or 0.0
     toplam_satis = toplam_satis or 0
     
-    aylik_tahmini_satis = max(toplam_satis * 4, 0) if toplam_satis > 0 else 5 # Satış yoksa bile potansiyel simülasyonu
+    aylik_tahmini_satis = max(toplam_satis * 4, 0) if toplam_satis > 0 else 8
     aylik_tahmini_ciro = aylik_tahmini_satis * fiyat
 
     risk_puan = 50
@@ -73,11 +88,10 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     else:
         risk_puan += 15
         
-    # Fiyata göre dinamik risk analizi
     if 0 < fiyat < 150:
-        risk_puan += 15 # Düşük bütçeli ürün rekabeti yüksek risk
+        risk_puan += 15
     elif fiyat >= 500:
-        risk_puan -= 10 # Yüksek değerli ürün fırsatı
+        risk_puan -= 10
 
     risk_puan = max(5, min(95, risk_puan))
     
@@ -139,21 +153,15 @@ HTML_TEMPLATE = '''
     </nav>
 
     <div class="container mb-5">
-        <!-- ÜRÜN EKLEME FORMU -->
+        <!-- TEK LİKNLE AKILLI EKLEME FORMU -->
         <div class="card p-4 mb-4">
             <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-plus-circle me-2"></i>Takibe & Analize Yeni Ürün Ekle</h5>
             <form action="/ekle" method="POST" class="row g-3">
-                <div class="col-md-7">
+                <div class="col-md-10">
                     <input type="url" name="url" class="form-control form-control-lg" placeholder="https://www.trendyol.com/..." required>
                 </div>
                 <div class="col-md-2">
-                    <input type="number" step="0.01" name="fiyat" class="form-control form-control-lg" placeholder="Fiyat (TL)" required>
-                </div>
-                <div class="col-md-2">
-                    <input type="number" name="stok" class="form-control form-control-lg" placeholder="Stok Adedi" required>
-                </div>
-                <div class="col-md-1">
-                    <button type="submit" class="btn btn-warning btn-lg text-white w-100 fw-bold h-100" style="background-color: #f27a1a;"><i class="fa-solid fa-plus"></i></button>
+                    <button type="submit" class="btn btn-warning btn-lg text-white w-100 fw-bold" style="background-color: #f27a1a;">Takibe Al</button>
                 </div>
             </form>
         </div>
@@ -168,7 +176,7 @@ HTML_TEMPLATE = '''
                         <h6 class="fw-bold text-truncate mb-1" title="{{ u.urun_adi }}">{{ u.urun_adi }}</h6>
                         <a href="{{ u.url }}" target="_blank" class="text-decoration-none small text-muted"><i class="fa-solid fa-arrow-up-right-from-square me-1"></i>Trendyol'da İncele</a>
                         
-                        <!-- GÜNCELLEME FORM MODülü -->
+                        <!-- DÜZENLEME MODÜLÜ -->
                         <form action="/guncelle/{{ u.id }}" method="POST" class="row g-1 mt-2">
                             <div class="col-6">
                                 <input type="number" step="0.01" name="fiyat" value="{{ u.fiyat }}" class="form-control form-control-sm" placeholder="Fiyat" required>
@@ -177,7 +185,7 @@ HTML_TEMPLATE = '''
                                 <input type="number" name="stok" value="{{ u.son_stok }}" class="form-control form-control-sm" placeholder="Stok" required>
                             </div>
                             <div class="col-2">
-                                <button type="submit" class="btn btn-outline-secondary btn-sm w-100" title="Değişiklikleri Kaydet"><i class="fa-solid fa-check"></i></button>
+                                <button type="submit" class="btn btn-outline-secondary btn-sm w-100" title="Kaydet"><i class="fa-solid fa-check"></i></button>
                             </div>
                         </form>
                     </div>
@@ -215,7 +223,7 @@ HTML_TEMPLATE = '''
                     </div>
 
                     <div class="col-md-1 text-end">
-                        <a href="/sil/{{ u.id }}" class="btn btn-outline-danger btn-sm" onclick="return confirm('Bu ürünü silmek istediğinize emin misiniz?')" title="Ürünü Sil">
+                        <a href="/sil/{{ u.id }}" class="btn btn-outline-danger btn-sm" onclick="return confirm('Bu ürünü silmek istediğinize emin misiniz?')" title="Sil">
                             <i class="fa-solid fa-trash-can"></i>
                         </a>
                     </div>
@@ -224,7 +232,7 @@ HTML_TEMPLATE = '''
             {% endfor %}
         {% else %}
             <div class="alert alert-info text-center p-4">
-                Henüz takip edilen ürün yok. Yukarıdaki alandan ilk Trendyol ürün linkini, fiyatını ve stok miktarını girerek ekleyebilirsiniz!
+                Henüz takip edilen ürün yok. Yukarıdaki alandan ilk Trendyol ürün linkini ekleyebilirsiniz!
             </div>
         {% endif %}
     </div>
@@ -262,12 +270,9 @@ def index():
 def ekle():
     try:
         raw_url = request.form.get('url', '').strip()
-        fiyat = float(request.form.get('fiyat', 0))
-        stok = int(request.form.get('stok', 0))
-        
         if raw_url:
             clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-            urun_adi = url_den_isim_cikart(clean_url)
+            urun_adi, tahmin_fiyat, tahmin_stok = url_analiz_ve_tahmin(clean_url)
             
             conn = get_db()
             cursor = conn.cursor()
@@ -278,10 +283,8 @@ def ekle():
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
                     urun_adi=excluded.urun_adi,
-                    fiyat=excluded.fiyat,
-                    son_stok=excluded.son_stok,
                     son_guncelleme=excluded.son_guncelleme
-            ''', (clean_url, urun_adi, fiyat, stok, now))
+            ''', (clean_url, urun_adi, tahmin_fiyat, tahmin_stok, now))
             
             conn.commit()
             conn.close()
@@ -299,16 +302,14 @@ def guncelle(id):
         conn = get_db()
         cursor = conn.cursor()
         
-        # Eski stoğu alıp satış farkı hesaplayalım
         cursor.execute("SELECT son_stok, fiyat, toplam_satis, toplam_ciro FROM urunler WHERE id=?", (id,))
-         eski_urun = cursor.fetchone()
+        eski_urun = cursor.fetchone()
         
         if eski_urun:
             eski_stok = eski_urun['son_stok']
             toplam_satis = eski_urun['toplam_satis']
             toplam_ciro = eski_urun['toplam_ciro']
             
-            # Stok azaldıysa otomatik satış tespiti!
             if stok < eski_stok:
                 satilan = eski_stok - stok
                 toplam_satis += satilan
