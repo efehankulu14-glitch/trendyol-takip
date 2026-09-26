@@ -76,7 +76,7 @@ def init_db():
 
 init_db()
 
-# --- URL BİLGİ ÇIKARICI ---
+# --- URL'DEN BİLGİ VE ID AYRIŞTIRMA ---
 def url_den_isim_ve_id(raw_url):
     try:
         parsed = urlparse(raw_url)
@@ -116,7 +116,6 @@ def trendyol_veri_cek(raw_url):
         "Accept-Language": "tr-TR,tr;q=0.9"
     }
 
-    # 1. API Üzerinden Çekme (Timeout: 2 saniye)
     if content_id:
         try:
             api_url = f"https://public.trendyol.com/discovery-web-productgw-service/api/productDetail/{content_id}?storefrontId=1"
@@ -138,26 +137,6 @@ def trendyol_veri_cek(raw_url):
                 return {"urun_adi": urun_adi[:70], "fiyat": float(fiyat), "stok": int(stok)}
         except Exception:
             pass
-
-    # 2. HTML Üzerinden Çekme (Timeout: 2 saniye)
-    try:
-        res = requests.get(clean_url, headers=headers, timeout=2)
-        if res.status_code == 200:
-            html = res.text
-            match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
-            if match:
-                data = json.loads(match.group(1))
-                product = data.get("product", {})
-                if product.get("name"):
-                    urun_adi = product.get("name")
-                price_obj = product.get("price", {})
-                fiyat = price_obj.get("discountedPrice", {}).get("value") or \
-                        price_obj.get("sellingPrice", {}).get("value") or 0.0
-                variants = product.get("variants", [])
-                if variants:
-                    stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
-    except Exception:
-        pass
 
     return {
         "urun_adi": str(urun_adi)[:70],
@@ -244,18 +223,26 @@ HTML_TEMPLATE = '''
     </nav>
 
     <div class="container mb-5">
+        <!-- HİBRİT EKLEME FORMU -->
         <div class="card p-4 mb-4">
             <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-plus-circle me-2"></i>Takibe & Analize Yeni Ürün Ekle</h5>
-            <form action="/ekle" method="POST" class="row g-3">
-                <div class="col-md-10">
-                    <input type="url" name="url" class="form-control form-control-lg" placeholder="https://www.trendyol.com/..." required>
+            <form action="/ekle" method="POST" class="row g-2">
+                <div class="col-md-6">
+                    <input type="url" name="url" class="form-control" placeholder="Trendyol Linki (https://...)" required>
                 </div>
                 <div class="col-md-2">
-                    <button type="submit" class="btn btn-warning btn-lg text-white w-100 fw-bold" style="background-color: #f27a1a;">Takibe Al</button>
+                    <input type="number" step="0.01" name="fiyat" class="form-control" placeholder="Başlangıç Fiyatı (TL)">
+                </div>
+                <div class="col-md-2">
+                    <input type="number" name="stok" class="form-control" placeholder="Mevcut Stok">
+                </div>
+                <div class="col-md-2">
+                    <button type="submit" class="btn btn-warning text-white w-100 fw-bold" style="background-color: #f27a1a;">Takibe Al</button>
                 </div>
             </form>
         </div>
 
+        <!-- ÜRÜN LİSTESİ -->
         <h4 class="fw-bold mb-3 text-dark"><i class="fa-solid fa-chart-line me-2"></i>Takip Edilen Ürünler ve Pazar Analizi</h4>
         
         {% if urunler %}
@@ -266,7 +253,7 @@ HTML_TEMPLATE = '''
                         <h6 class="fw-bold text-truncate mb-1" title="{{ u.urun_adi }}">{{ u.urun_adi }}</h6>
                         <a href="{{ u.url }}" target="_blank" class="text-decoration-none small text-muted"><i class="fa-solid fa-arrow-up-right-from-square me-1"></i>Trendyol'da İncele</a>
                         <div class="mt-2">
-                            <span class="me-3"><strong>Fiyat:</strong> <span class="text-success fw-bold">{{ u.fiyat if u.fiyat > 0 else '0.00' }} TL</span></span>
+                            <span class="me-3"><strong>Fiyat:</strong> <span class="text-success fw-bold">{{ "{:,.2f}".format(u.fiyat) }} TL</span></span>
                             <span><strong>Kalan Stok:</strong> {{ u.son_stok }}</span>
                         </div>
                     </div>
@@ -354,39 +341,39 @@ def index():
 def ekle():
     try:
         raw_url = request.form.get('url', '').strip()
+        fiyat_input = request.form.get('fiyat', '').strip()
+        stok_input = request.form.get('stok', '').strip()
+
         if raw_url:
             clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
             _, tahmini_isim = url_den_isim_ve_id(clean_url)
+            
+            # Otomatik Scraper Denemesi
+            scraped = trendyol_veri_cek(clean_url)
+            
+            # Öncelik Kullanıcı Girdisi, yoksa Scraped Değer
+            final_fiyat = float(fiyat_input) if fiyat_input else scraped['fiyat']
+            final_stok = int(stok_input) if stok_input else scraped['stok']
+            final_isim = scraped['urun_adi'] if scraped['urun_adi'] != "Trendyol Ürünü" else tahmini_isim
             
             conn = get_db()
             cursor = conn.cursor()
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
-            # Anında Çökmeden Veritabanına Ekle
             cursor.execute('''
-                INSERT OR IGNORE INTO urunler (url, urun_adi, fiyat, son_stok, son_guncelleme)
-                VALUES (?, ?, 0.0, 0, ?)
-            ''', (clean_url, tahmini_isim, now))
+                INSERT INTO urunler (url, urun_adi, fiyat, son_stok, son_guncelleme)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    urun_adi=excluded.urun_adi,
+                    fiyat=CASE WHEN excluded.fiyat > 0 THEN excluded.fiyat ELSE urunler.fiyat END,
+                    son_stok=CASE WHEN excluded.son_stok > 0 THEN excluded.son_stok ELSE urunler.son_stok END,
+                    son_guncelleme=excluded.son_guncelleme
+            ''', (clean_url, final_isim, final_fiyat, final_stok, now))
+            
             conn.commit()
             conn.close()
-
-            # Arka Plan Taraması (Çökse bile try-except ile yakala)
-            try:
-                veri = trendyol_veri_cek(clean_url)
-                if veri and (veri['fiyat'] > 0 or veri['stok'] > 0):
-                    conn = get_db()
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        UPDATE urunler 
-                        SET urun_adi=?, fiyat=?, son_stok=?, son_guncelleme=?
-                        WHERE url=?
-                    ''', (veri['urun_adi'], veri['fiyat'], veri['stok'], now, clean_url))
-                    conn.commit()
-                    conn.close()
-            except Exception:
-                pass
-    except Exception as global_ekle_err:
-        print("Global Ekle Hatası:", global_ekle_err)
+    except Exception as e:
+        print("Ekleme Hatası:", e)
 
     return redirect(url_for('index'))
 
