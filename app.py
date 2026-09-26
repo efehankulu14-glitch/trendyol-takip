@@ -46,7 +46,6 @@ def trendyol_verilerini_cek(raw_url):
     toplam_satis = 0
     pazar_mesaji = "Analiz bekleniyor..."
     
-    # 1. Adım: Önce URL'den ismi garanti çıkaralım
     try:
         parsed = urlparse(raw_url)
         path = parsed.path.strip('/')
@@ -61,7 +60,6 @@ def trendyol_verilerini_cek(raw_url):
     except Exception:
         pass
 
-    # 2. Adım: Trendyol sayfasına gerçek bir tarayıcı gibi istek atıp HTML'i kazıyalım
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
@@ -73,7 +71,6 @@ def trendyol_verilerini_cek(raw_url):
             soup = BeautifulSoup(response.text, 'html.parser')
             page_text = soup.get_text()
 
-            # Fiyat bulma denemesi (Trendyol fiyat class'ları veya metin arama)
             fiyat_tag = soup.find('span', {'class': 'prc-dsc'}) or soup.find('div', {'class': 'product-price'})
             if fiyat_tag:
                 fiyat_text = fiyat_tag.get_text().replace('TL', '').replace('.', '').replace(',', '.').strip()
@@ -81,36 +78,26 @@ def trendyol_verilerini_cek(raw_url):
                 if fiyat_match:
                     fiyat = float(fiyat_match.group())
 
-            # Senin bahsettiğin "X günde Y adet sattı", "sepetinde" gibi ibareleri yakalayalım
-            # Örnek: "3 günde 500'den fazla ürün sattı" veya "500+ satış"
-            satis_eslesmeleri = re.findall(r'(\d+)\s*(?:günde|gündür|saatte).*?(\d+)\s*(?:adet|ürün|kez|kişi)', page_text, re.IGNORECASE)
+            sepet_match = re.search(r'(\d+[\d\.]*)\s*kişinin\s*sepetinde', page_text, re.IGNORECASE)
+            if sepet_match:
+                pazar_mesaji = f"🔥 {sepet_match.group(0)}"
             
-            # Alternatif basit yakalama: Metin içinde geçen rakam ve satış kalıpları
-            if "satış" in page_text.lower() or "sepet" in page_text.lower():
-                # Sepetteki kişi sayısı
-                sepet_match = re.search(r'(\d+[\d\.]*)\s*kişinin\s*sepetinde', page_text, re.IGNORECASE)
-                if sepet_match:
-                    pazar_mesaji = f"🔥 {sepet_match.group(0)}"
-                
-                # Çok satan / popülerlik ibaresi
-                satan_match = re.search(r'(\d+)\s*günde\s*(\d+)[^\w]*(?:adet|fazla)', page_text, re.IGNORECASE)
-                if satan_match:
-                    gun = satan_match.group(1)
-                    adet = int(satan_match.group(2))
-                    toplam_satis = adet * (30 / int(gun)) # Aylığa projeksiyon
-                    pazar_mesaji = f"🚀 Son {gun} günde {adet}+ satış yapıldı!"
-                else:
-                    # Genel bir popülarite mesajı bulmaya çalışalım
-                    for line in page_text.split('\n'):
-                        if any(k in line.lower() for k in ['sepet', 'görüntüleme', 'tükenmeden', 'favori']):
-                            clean_l = line.strip()
-                            if len(clean_l) > 10 and len(clean_l) < 100:
-                                pazar_mesaji = clean_l
-                                break
+            satan_match = re.search(r'(\d+)\s*günde\s*(\d+)[^\w]*(?:adet|fazla)', page_text, re.IGNORECASE)
+            if satan_match:
+                gun = satan_match.group(1)
+                adet = int(satan_match.group(2))
+                toplam_satis = adet * (30 / int(gun))
+                pazar_mesaji = f"🚀 Son {gun} günde {adet}+ satış yapıldı!"
+            else:
+                for line in page_text.split('\n'):
+                    if any(k in line.lower() for k in ['sepet', 'görüntüleme', 'tükenmeden', 'favori']):
+                        clean_l = line.strip()
+                        if len(clean_l) > 10 and len(clean_l) < 100:
+                            pazar_mesaji = clean_l
+                            break
 
-            # Eğer metinden doğrudan satış çıkaramadıysak ama popülerse simüle edelim
             if toplam_satis == 0:
-                toplam_satis = 25 # Varsayılan aktif talep
+                toplam_satis = 25
 
     except Exception as e:
         print("Scraping Hatası:", e)
@@ -118,7 +105,7 @@ def trendyol_verilerini_cek(raw_url):
         toplam_satis = 10
 
     if fiyat == 0.0:
-        fiyat = 199.90 # Fiyat çekilemezse ortalama baz fiyat
+        fiyat = 199.90
 
     toplam_ciro = toplam_satis * fiyat
     return urun_adi, fiyat, int(toplam_satis), float(toplam_ciro), pazar_mesaji
@@ -193,7 +180,6 @@ HTML_TEMPLATE = '''
     </nav>
 
     <div class="container mb-5">
-        <!-- ÜRÜN EKLEME FORMU -->
         <div class="card p-4 mb-4">
             <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-plus-circle me-2"></i>Trendyol Ürün Linkini Yapıştır, İstatistikleri Otomatik Çek</h5>
             <form action="/ekle" method="POST" class="row g-3">
@@ -216,7 +202,6 @@ HTML_TEMPLATE = '''
                         <h6 class="fw-bold text-truncate mb-1" title="{{ u.urun_adi }}">{{ u.urun_adi }}</h6>
                         <a href="{{ u.url }}" target="_blank" class="text-decoration-none small text-muted"><i class="fa-solid fa-arrow-up-right-from-square me-1"></i>Trendyol'da İncele</a>
                         
-                        <!-- Trend / Sosyal Kanıt Notu -->
                         <div class="pazar-notu">
                             <i class="fa-solid fa-fire text-danger me-1"></i> {{ u.pazar_mesaji }}
                         </div>
@@ -276,7 +261,6 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# --- ROUTE'LAR ---
 @app.route('/')
 def index():
     conn = get_db()
