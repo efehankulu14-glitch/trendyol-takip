@@ -47,7 +47,7 @@ def eposta_gonder(urun_adi, fiyat, stok, satis_adedi, ciro, url):
     except Exception as e:
         print(f"E-posta gönderme hatası: {e}")
 
-# --- VERİTABANI OLUŞTURMA & BAĞLANTI ---
+# --- VERİTABANI OLUŞTURMA & OTOMATİK MİGRASYON ---
 def get_db():
     conn = sqlite3.connect('trendyol_takip.db')
     conn.row_factory = sqlite3.Row
@@ -68,6 +68,16 @@ def init_db():
             son_guncelleme TEXT
         )
     ''')
+    
+    # Eski tablodan kalan eksik sütunları otomatik ekleme kontrolü
+    cursor.execute("PRAGMA table_info(urunler)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'toplam_satis' not in columns:
+        cursor.execute("ALTER TABLE urunler ADD COLUMN toplam_satis INTEGER DEFAULT 0")
+    if 'toplam_ciro' not in columns:
+        cursor.execute("ALTER TABLE urunler ADD COLUMN toplam_ciro REAL DEFAULT 0.0")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS stok_gecmisi (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,30 +130,30 @@ def trendyol_veri_cek(url):
         print(f"Scrape Hatası ({url}): {e}")
         return None
 
-# --- PAZAR ANALİZİ ENGINE (ALGORİTMALAR) ---
+# --- PAZAR ANALİZİ ENGINE ---
 def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     fiyat = fiyat or 0.0
     toplam_satis = toplam_satis or 0
     
-    # 1. Aylık Tahmini Satış & Ciro (Son duruma göre 30 günlük projeksiyon)
+    # 1. Aylık Tahmini Satış & Ciro
     aylik_tahmini_satis = max(toplam_satis * 4, 0) if toplam_satis > 0 else 0
     aylik_tahmini_ciro = aylik_tahmini_satis * fiyat
 
     # 2. Pazara Giriş Risk Skoru (1 - 100 Arası)
-    risk_puan = 50  # Başlangıç nötr skor
+    risk_puan = 50
     
     if toplam_satis > 15:
-        risk_puan -= 20  # Yüksek talep var, risk düşük
+        risk_puan -= 20
     elif toplam_satis == 0:
-        risk_puan += 15  # Satış hareketsiz, risk yüksek
+        risk_puan += 15
         
     if fiyat < 100:
-        risk_puan += 10  # Düşük kar marjı potansiyeli
+        risk_puan += 10
     elif fiyat > 500:
-        risk_puan -= 10  # Yüksek ciro potansiyeli
+        risk_puan -= 10
 
     if stok is not None and stok == 0:
-        risk_puan += 20  # Stok tükenmiş/Tedarik riski
+        risk_puan += 20
 
     risk_puan = max(1, min(99, risk_puan))
     
@@ -289,7 +299,7 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# --- ROUTE'LAR (SAYFA YÖNLENDİRMELERİ) ---
+# --- ROUTE'LAR ---
 @app.route('/')
 def index():
     conn = get_db()
@@ -301,7 +311,7 @@ def index():
     for r in rows:
         u = dict(r)
         
-        # Veritabanı sütun isimlerine karşı güvenli okuma
+        # Güvenli Key alma yöntemi
         satis = u.get('toplam_satis') if u.get('toplam_satis') is not None else u.get('toplam_satis', 0)
         ciro = u.get('toplam_ciro') if u.get('toplam_ciro') is not None else u.get('toplam_ciro', 0.0)
         
@@ -344,8 +354,8 @@ def tarat():
         u = dict(r)
         yeni = trendyol_veri_cek(u['url'])
         
-        toplam_satis = u.get('toplam_satis') if u.get('toplam_satis') is not None else u.get('toplam_satis', 0) or 0
-        toplam_ciro = u.get('toplam_ciro') if u.get('toplam_ciro') is not None else u.get('toplam_ciro', 0.0) or 0.0
+        toplam_satis = u.get('toplam_satis') or 0
+        toplam_ciro = u.get('toplam_ciro') or 0.0
 
         if yeni and yeni['stok'] is not None and u['son_stok'] is not None:
             if yeni['stok'] < u['son_stok']:
