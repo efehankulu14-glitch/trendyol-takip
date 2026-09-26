@@ -61,18 +61,22 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT UNIQUE,
             urun_adi TEXT,
-            fiyat REAL,
-            son_stok INTEGER,
+            fiyat REAL DEFAULT 0.0,
+            son_stok INTEGER DEFAULT 0,
             toplam_satis INTEGER DEFAULT 0,
             toplam_ciro REAL DEFAULT 0.0,
             son_guncelleme TEXT
         )
     ''')
     
-    # Eski tablodan kalan eksik sütunları otomatik ekleme kontrolü
+    # Eksik sütun kontrolü ve otomatik ekleme
     cursor.execute("PRAGMA table_info(urunler)")
     columns = [col[1] for col in cursor.fetchall()]
     
+    if 'fiyat' not in columns:
+        cursor.execute("ALTER TABLE urunler ADD COLUMN fiyat REAL DEFAULT 0.0")
+    if 'son_stok' not in columns:
+        cursor.execute("ALTER TABLE urunler ADD COLUMN son_stok INTEGER DEFAULT 0")
     if 'toplam_satis' not in columns:
         cursor.execute("ALTER TABLE urunler ADD COLUMN toplam_satis INTEGER DEFAULT 0")
     if 'toplam_ciro' not in columns:
@@ -311,13 +315,17 @@ def index():
     for r in rows:
         u = dict(r)
         
-        # Güvenli Key alma yöntemi
-        satis = u.get('toplam_satis') if u.get('toplam_satis') is not None else u.get('toplam_satis', 0)
-        ciro = u.get('toplam_ciro') if u.get('toplam_ciro') is not None else u.get('toplam_ciro', 0.0)
+        # GÜVENLİ VERİ ÇEKME (.get kullanımı)
+        satis = u.get('toplam_satis', 0) or 0
+        ciro = u.get('toplam_ciro', 0.0) or 0.0
+        fiyat = u.get('fiyat', 0.0) or 0.0
+        stok = u.get('son_stok', 0)
         
-        u['satis'] = satis or 0
-        u['ciro'] = ciro or 0.0
-        u['analiz'] = pazar_analizi_hesapla(u['satis'], u['fiyat'], u['son_stok'])
+        u['satis'] = satis
+        u['ciro'] = ciro
+        u['fiyat'] = fiyat
+        u['son_stok'] = stok
+        u['analiz'] = pazar_analizi_hesapla(satis, fiyat, stok)
         urunler.append(u)
         
     conn.close()
@@ -352,12 +360,12 @@ def tarat():
 
     for r in urunler:
         u = dict(r)
-        yeni = trendyol_veri_cek(u['url'])
+        yeni = trendyol_veri_cek(u.get('url', ''))
         
-        toplam_satis = u.get('toplam_satis') or 0
-        toplam_ciro = u.get('toplam_ciro') or 0.0
+        toplam_satis = u.get('toplam_satis', 0) or 0
+        toplam_ciro = u.get('toplam_ciro', 0.0) or 0.0
 
-        if yeni and yeni['stok'] is not None and u['son_stok'] is not None:
+        if yeni and yeni['stok'] is not None and u.get('son_stok') is not None:
             if yeni['stok'] < u['son_stok']:
                 satis_adedi = u['son_stok'] - yeni['stok']
                 ek_ciro = satis_adedi * yeni['fiyat']
