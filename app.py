@@ -7,7 +7,7 @@ from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 app = Flask(__name__)
 
@@ -74,38 +74,44 @@ def init_db():
 
 init_db()
 
-# --- HATA GEÇİRMEZ GÜVENLİ SCRAPER ---
+# --- URL PARSER & GELİŞMİŞ SCRAPER ---
+def url_den_isim_cikart(raw_url):
+    try:
+        parsed = urlparse(raw_url)
+        path = parsed.path.strip('/')
+        parts = path.split('/')
+        if parts:
+            slug = parts[-1] if '-p-' in parts[-1] else parts[0]
+            if '-p-' in slug:
+                slug = slug.split('-p-')[0]
+            clean_name = unquote(slug).replace('-', ' ').title()
+            if len(clean_name) > 3:
+                return clean_name
+    except Exception:
+        pass
+    return "Trendyol Takip Ürünü"
+
 def trendyol_veri_cek(raw_url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "tr-TR,tr;q=0.9"
+        "Accept-Language": "tr-TR,tr;q=0.9",
+        "Referer": "https://www.google.com/"
     }
-    
-    # URL Temizleme (Güvenli Yöntem)
-    try:
-        parsed_url = urlparse(raw_url)
-        clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-    except Exception:
-        clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
 
-    # Varsayılan fallback ürün adı oluşturma
-    path_parts = [p for p in parsed_url.path.split('/') if p] if 'parsed_url' in locals() else []
-    if path_parts:
-        tahmini_isim = path_parts[0].replace('-', ' ').title()
-    else:
-        tahmini_isim = "Trendyol Takip Ürünü"
-
-    urun_adi = tahmini_isim
+    clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
+    urun_adi = url_den_isim_cikart(clean_url)
     fiyat = 0.0
     stok = 0
 
     try:
-        res = requests.get(clean_url, headers=headers, timeout=8)
+        session = requests.Session()
+        res = session.get(clean_url, headers=headers, timeout=10)
+        
         if res.status_code == 200:
             html = res.text
             
-            # JSON parsing
+            # 1. Yöntem: State JSON Parsing
             match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
             if match:
                 try:
@@ -126,22 +132,25 @@ def trendyol_veri_cek(raw_url):
                 except Exception as json_err:
                     print("JSON Parse Hatası:", json_err)
 
-            # Fallback regex parsing
+            # 2. Yöntem: Regex Fallback
             if fiyat == 0.0:
                 price_match = re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html) or re.search(r'"price":\s*([\d\.]+)', html)
                 if price_match:
                     fiyat = float(price_match.group(1))
 
-            if urun_adi == tahmini_isim:
+            # Title içinden başlık çekme
+            if urun_adi == "Trendyol Takip Ürünü":
                 title_match = re.search(r'<title>(.*?)</title>', html)
                 if title_match:
-                    urun_adi = title_match.group(1).replace("- Trendyol", "").strip()
+                    extracted_title = title_match.group(1).split('|')[0].replace("- Trendyol", "").strip()
+                    if extracted_title:
+                        urun_adi = extracted_title
 
     except Exception as e:
-        print(f"Fetch Hatası ({clean_url}): {e}")
+        print(f"Scrape Hatası ({clean_url}): {e}")
 
     return {
-        "urun_adi": str(urun_adi)[:70],
+        "urun_adi": str(urun_adi)[:80],
         "fiyat": float(fiyat) if fiyat else 0.0,
         "stok": int(stok) if stok else 0
     }
@@ -160,7 +169,7 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     elif toplam_satis == 0:
         risk_puan += 15
         
-    if fiyat < 100:
+    if fiyat > 0 and fiyat < 100:
         risk_puan += 10
     elif fiyat > 500:
         risk_puan -= 10
