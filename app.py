@@ -7,6 +7,7 @@ from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -73,80 +74,77 @@ def init_db():
 
 init_db()
 
-# --- GÜÇLENDİRİLMİŞ TRENDYOL SCRAPER ---
-def trendyol_veri_cek(url):
+# --- HATA GEÇİRMEZ GÜVENLİ SCRAPER ---
+def trendyol_veri_cek(raw_url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "tr-TR,tr;q=0.9"
     }
     
-    # URL Temizleme
-    clean_url = url.split('?')[0]
-    
+    # URL Temizleme (Güvenli Yöntem)
     try:
-        res = requests.get(clean_url, headers=headers, timeout=10)
-        html = res.text
-        
-        urun_adi = None
-        fiyat = 0.0
-        stok = 0
+        parsed_url = urlparse(raw_url)
+        clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+    except Exception:
+        clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
 
-        # Yöntem 1: Initial State JSON
-        match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
-        if match:
-            try:
-                data = json.loads(match.group(1))
-                product = data.get("product", {})
-                
-                urun_adi = product.get("name")
-                price_obj = product.get("price", {})
-                fiyat = price_obj.get("discountedPrice", {}).get("value") or \
-                        price_obj.get("sellingPrice", {}).get("value") or \
-                        price_obj.get("originalPrice", {}).get("value") or 0.0
-                
-                variants = product.get("variants", [])
-                if variants:
-                    stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
-            except Exception as json_err:
-                print("JSON Parsing Hatası:", json_err)
+    # Varsayılan fallback ürün adı oluşturma
+    path_parts = [p for p in parsed_url.path.split('/') if p] if 'parsed_url' in locals() else []
+    if path_parts:
+        tahmini_isim = path_parts[0].replace('-', ' ').title()
+    else:
+        tahmini_isim = "Trendyol Takip Ürünü"
 
-        # Yöntem 2: Meta Tag veya HTML Regex Fallback
-        if not urun_adi or fiyat == 0:
-            title_match = re.search(r'<h1 class="pr-new-br"[^>]*>(.*?)</h1>', html) or re.search(r'<title>(.*?)</title>', html)
-            if title_match:
-                urun_adi = title_match.group(1).replace("- Trendyol", "").strip()
+    urun_adi = tahmini_isim
+    fiyat = 0.0
+    stok = 0
+
+    try:
+        res = requests.get(clean_url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            html = res.text
             
-            price_match = re.search(r'"price":\s*([\d\.]+)', html) or re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html)
-            if price_match:
-                fiyat = float(price_match.group(1))
+            # JSON parsing
+            match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    product = data.get("product", {})
+                    
+                    if product.get("name"):
+                        urun_adi = product.get("name")
+                    
+                    price_obj = product.get("price", {})
+                    fiyat = price_obj.get("discountedPrice", {}).get("value") or \
+                            price_obj.get("sellingPrice", {}).get("value") or \
+                            price_obj.get("originalPrice", {}).get("value") or 0.0
+                    
+                    variants = product.get("variants", [])
+                    if variants:
+                        stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
+                except Exception as json_err:
+                    print("JSON Parse Hatası:", json_err)
 
-        # Eğer isim çıkarılamadıysa varsayılan isim ver
-        if not urun_adi:
-            # URL'den ürün ismini tahmin et
-            url_parts = clean_url.split('/')
-            if len(url_parts) > 3:
-                urun_adi = url_parts[-2].replace('-', ' ').title()
-            else:
-                urun_adi = "Trendyol Ürünü"
+            # Fallback regex parsing
+            if fiyat == 0.0:
+                price_match = re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html) or re.search(r'"price":\s*([\d\.]+)', html)
+                if price_match:
+                    fiyat = float(price_match.group(1))
 
-        return {
-            "urun_adi": urun_adi[:60], # İsim uzunsa kes
-            "fiyat": float(fiyat) if fiyat else 0.0,
-            "stok": int(stok) if stok else 0
-        }
+            if urun_adi == tahmini_isim:
+                title_match = re.search(r'<title>(.*?)</title>', html)
+                if title_match:
+                    urun_adi = title_match.group(1).replace("- Trendyol", "").strip()
+
     except Exception as e:
-        print(f"Scrape Genel Hatası ({url}): {e}")
-        # Hata alsa bile veritabanına eklenmesini sağla
-        url_parts = clean_url.split('/')
-        tahmini_isim = url_parts[-2].replace('-', ' ').title() if len(url_parts) > 3 else "Trendyol Ürünü"
-        return {
-            "urun_adi": tahmini_isim[:60],
-            "fiyat": 0.0,
-            "stok": 0
-        }
+        print(f"Fetch Hatası ({clean_url}): {e}")
+
+    return {
+        "urun_adi": str(urun_adi)[:70],
+        "fiyat": float(fiyat) if fiyat else 0.0,
+        "stok": int(stok) if stok else 0
+    }
 
 # --- PAZAR ANALİZİ ENGINE ---
 def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
@@ -332,75 +330,81 @@ def index():
 
 @app.route('/ekle', methods=['POST'])
 def ekle():
-    url = request.form.get('url', '').strip()
-    if url:
-        veri = trendyol_veri_cek(url)
-        conn = get_db()
-        cursor = conn.cursor()
-        try:
+    try:
+        url = request.form.get('url', '').strip()
+        if url:
+            veri = trendyol_veri_cek(url)
+            conn = get_db()
+            cursor = conn.cursor()
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute('''
-                INSERT INTO urunler (url, urun_adi, fiyat, son_stok, son_guncelleme)
+                INSERT OR REPLACE INTO urunler (url, urun_adi, fiyat, son_stok, son_guncelleme)
                 VALUES (?, ?, ?, ?, ?)
             ''', (url, veri['urun_adi'], veri['fiyat'], veri['stok'], now))
             conn.commit()
-        except sqlite3.IntegrityError:
-            pass
-        conn.close()
+            conn.close()
+    except Exception as e:
+        print("Ekleme Hatası:", e)
     return redirect(url_for('index'))
 
 @app.route('/tarat')
 def tarat():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM urunler")
-    urunler = cursor.fetchall()
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM urunler")
+        urunler = cursor.fetchall()
 
-    for r in urunler:
-        u = dict(r)
-        yeni = trendyol_veri_cek(u.get('url', ''))
+        for r in urunler:
+            u = dict(r)
+            yeni = trendyol_veri_cek(u.get('url', ''))
+            
+            if yeni:
+                toplam_satis = u.get('toplam_satis') or 0
+                toplam_ciro = u.get('toplam_ciro') or 0.0
+                eski_stok = u.get('son_stok') or 0
+
+                guncel_fiyat = yeni['fiyat'] if yeni['fiyat'] > 0 else (u.get('fiyat') or 0.0)
+                guncel_stok = yeni['stok'] if yeni['stok'] > 0 else eski_stok
+
+                if guncel_stok < eski_stok and eski_stok > 0:
+                    satis_adedi = eski_stok - guncel_stok
+                    ek_ciro = satis_adedi * guncel_fiyat
+                    
+                    yeni_toplam_satis = toplam_satis + satis_adedi
+                    yeni_toplam_ciro = toplam_ciro + ek_ciro
+                    
+                    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    cursor.execute('''
+                        UPDATE urunler 
+                        SET urun_adi=?, fiyat=?, son_stok=?, toplam_satis=?, toplam_ciro=?, son_guncelleme=?
+                        WHERE id=?
+                    ''', (yeni['urun_adi'], guncel_fiyat, guncel_stok, yeni_toplam_satis, yeni_toplam_ciro, now, u['id']))
+                    
+                    conn.commit()
+                    eposta_gonder(yeni['urun_adi'], guncel_fiyat, guncel_stok, satis_adedi, ek_ciro, u['url'])
+                else:
+                    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    cursor.execute("UPDATE urunler SET urun_adi=?, fiyat=?, son_stok=?, son_guncelleme=? WHERE id=?", 
+                                   (yeni['urun_adi'], guncel_fiyat, guncel_stok, now, u['id']))
+                    conn.commit()
+
+        conn.close()
+    except Exception as e:
+        print("Taratma Hatası:", e)
         
-        if yeni:
-            toplam_satis = u.get('toplam_satis') or 0
-            toplam_ciro = u.get('toplam_ciro') or 0.0
-            eski_stok = u.get('son_stok') or 0
-
-            # Fiyat ve stok güncellemelerini uygula
-            guncel_fiyat = yeni['fiyat'] if yeni['fiyat'] > 0 else (u.get('fiyat') or 0.0)
-            guncel_stok = yeni['stok'] if yeni['stok'] > 0 else eski_stok
-
-            if guncel_stok < eski_stok and eski_stok > 0:
-                satis_adedi = eski_stok - guncel_stok
-                ek_ciro = satis_adedi * guncel_fiyat
-                
-                yeni_toplam_satis = toplam_satis + satis_adedi
-                yeni_toplam_ciro = toplam_ciro + ek_ciro
-                
-                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                cursor.execute('''
-                    UPDATE urunler 
-                    SET urun_adi=?, fiyat=?, son_stok=?, toplam_satis=?, toplam_ciro=?, son_guncelleme=?
-                    WHERE id=?
-                ''', (yeni['urun_adi'], guncel_fiyat, guncel_stok, yeni_toplam_satis, yeni_toplam_ciro, now, u['id']))
-                
-                conn.commit()
-                eposta_gonder(yeni['urun_adi'], guncel_fiyat, guncel_stok, satis_adedi, ek_ciro, u['url'])
-            else:
-                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                cursor.execute("UPDATE urunler SET urun_adi=?, fiyat=?, son_stok=?, son_guncelleme=? WHERE id=?", 
-                               (yeni['urun_adi'], guncel_fiyat, guncel_stok, now, u['id']))
-                conn.commit()
-
-    conn.close()
     return redirect(url_for('index'))
 
 @app.route('/sil/<int:id>')
 def sil(id):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM urunler WHERE id=?", (id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM urunler WHERE id=?", (id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Silme Hatası:", e)
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
