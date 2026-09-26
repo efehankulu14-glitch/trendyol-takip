@@ -41,22 +41,30 @@ def init_db():
 init_db()
 
 def fetch_trendyol_product_data(product_url):
-    """Cloudflare korumasını aşarak Trendyol sayfasından gerçek verileri çeker."""
+    """Cloudflare 403 engelini aşmak için Mobil Tarayıcı (iPhone) taklidi yapar."""
     scraper = cloudscraper.create_scraper(
         browser={
-            'custom': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'browser': 'safari',
+            'platform': 'ios',
+            'desktop': False
         }
     )
+    
+    # Trendyol'un mobil web isteklerini taklit eden başlıklar
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.trendyol.com/",
+        "X-Requested-With": "XMLHttpRequest"
     }
     
     try:
         clean_url = product_url.split('?')[0] if '?' in product_url else product_url
         response = scraper.get(clean_url, headers=headers, timeout=15)
+        
         if response.status_code != 200:
-            return {"success": False, "error": f"Trendyol sayfasına erişilemedi (Kod: {response.status_code})"}
+            return {"success": False, "error": f"Cloudflare engeli aşılamadı (Kod: {response.status_code})"}
         
         html_content = response.text
         
@@ -74,7 +82,7 @@ def fetch_trendyol_product_data(product_url):
             price_info = product.get('price', {})
             price = price_info.get('sellingPrice', {}).get('value') or price_info.get('discountedPrice', {}).get('value') or 0.0
             
-            rating_count = product.get('ratingCount', 0) # Gerçek Değerlendirme Sayısı
+            rating_count = product.get('ratingCount', 0) # Değerlendirme Sayısı
             review_count = product.get('reviewCount', 0) # Yorum Sayısı
             favorite_count = product.get('favoriteCount', 0) # Favori Sayısı
             
@@ -87,7 +95,7 @@ def fetch_trendyol_product_data(product_url):
                 "favoriteCount": int(favorite_count)
             }
         else:
-            return {"success": False, "error": "Ürün state verisi çözümlenemedi."}
+            return {"success": False, "error": "Ürün JSON state verisi çözümlenemedi."}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -132,7 +140,6 @@ def ekle():
         if raw_url:
             clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
             
-            # Otomatik Trendyol Kazıma İşlemi
             res = fetch_trendyol_product_data(clean_url)
             
             if res["success"]:
@@ -143,9 +150,9 @@ def ekle():
                 sepet_sayisi = max(int(favori_sayisi * 0.12), 15)
                 toplam_satis = max(int(yorum_sayisi * 3.5), 20)
                 toplam_ciro = toplam_satis * fiyat
-                pazar_mesaji = "Trendyol'dan Canlı ve Gerçek Çekildi"
+                pazar_mesaji = "Trendyol'dan Canlı Çekildi (Mobil Bypass)"
             else:
-                urun_adi = "Trendyol Ürünü (Yedek)"
+                urun_adi = "Trendyol Ürünü (Hata Yedek)"
                 fiyat = 118.00
                 yorum_sayisi = 0
                 favori_sayisi = 0
@@ -214,7 +221,7 @@ HTML_TEMPLATE = '''
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
             <span class="navbar-brand mb-0 h1"><i class="fa-solid fa-chart-line me-2"></i>Trendyol Akıllı Pazar Analiz Sistemi</span>
-            <span class="text-white small fw-bold"><i class="fa-solid fa-bolt me-1"></i>Tam Otomatik Mod Aktif</span>
+            <span class="text-white small fw-bold"><i class="fa-solid fa-bolt me-1"></i>Mobil Bypass Modu Aktif</span>
         </div>
     </nav>
 
@@ -297,7 +304,7 @@ HTML_TEMPLATE = '''
             {% endfor %}
         {% else %}
             <div class="alert alert-secondary text-center p-4">
-                Henüz ürün eklenmedi. Trendyol linkini yapıştır, saniyesinde gerçek verileri çekelim!
+                Henüz ürün eklenmedi. Trendyol linkini yapıştır, canlı verileri çekelim!
             </div>
         {% endif %}
     </div>
