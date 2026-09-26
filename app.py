@@ -44,11 +44,11 @@ def eposta_gonder(urun_adi, fiyat, stok, satis_adedi, ciro, url):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GONDEREN_EMAIL, GMAIL_UYGULAMA_SIFRESI)
             server.sendmail(GONDEREN_EMAIL, ALICI_EMAIL, msg.as_string())
-        print(f"E-posta başarıyla gönderildi: {urun_adi[:20]}")
+        print(f"E-posta gönderildi: {urun_adi[:20]}")
     except Exception as e:
-        print(f"E-posta gönderme hatası: {e}")
+        print(f"E-posta hatası: {e}")
 
-# --- VERİTABANI OLUŞTURMA ---
+# --- VERİTABANI BAĞLANTISI ---
 def get_db():
     conn = sqlite3.connect('trendyol_takip.db')
     conn.row_factory = sqlite3.Row
@@ -74,80 +74,98 @@ def init_db():
 
 init_db()
 
-# --- URL PARSER & GELİŞMİŞ SCRAPER ---
-def url_den_isim_cikart(raw_url):
+# --- URL'DEN BİLGİ VE ID AYRIŞTIRMA ---
+def url_den_content_id_ve_isim(raw_url):
     try:
         parsed = urlparse(raw_url)
         path = parsed.path.strip('/')
         parts = path.split('/')
+        
+        content_id = None
+        for part in parts:
+            if '-p-' in part:
+                id_match = re.search(r'-p-(\d+)', part)
+                if id_match:
+                    content_id = id_match.group(1)
+                slug = part.split('-p-')[0]
+                clean_name = unquote(slug).replace('-', ' ').title()
+                return content_id, clean_name
+        
         if parts:
-            slug = parts[-1] if '-p-' in parts[-1] else parts[0]
-            if '-p-' in slug:
-                slug = slug.split('-p-')[0]
-            clean_name = unquote(slug).replace('-', ' ').title()
-            if len(clean_name) > 3:
-                return clean_name
+            clean_name = unquote(parts[0]).replace('-', ' ').title()
+            return None, clean_name
     except Exception:
         pass
-    return "Trendyol Takip Ürünü"
+    return None, "Trendyol Ürünü"
 
+# --- KESİNTİSİZ TRENDYOL DATA SCRAPER ---
 def trendyol_veri_cek(raw_url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "tr-TR,tr;q=0.9",
-        "Referer": "https://www.google.com/"
-    }
-
     clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-    urun_adi = url_den_isim_cikart(clean_url)
+    content_id, url_urun_adi = url_den_content_id_ve_isim(clean_url)
+    
+    urun_adi = url_urun_adi
     fiyat = 0.0
     stok = 0
 
-    try:
-        session = requests.Session()
-        res = session.get(clean_url, headers=headers, timeout=10)
-        
-        if res.status_code == 200:
-            html = res.text
-            
-            # 1. Yöntem: State JSON Parsing
-            match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
-            if match:
-                try:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "tr-TR,tr;q=0.9",
+        "Referer": "https://www.trendyol.com/"
+    }
+
+    # 1. Yöntem: Content ID Varsa Trendyol Public Product API / Widget Sorgusu
+    if content_id:
+        try:
+            api_url = f"https://public.trendyol.com/discovery-web-productgw-service/api/productDetail/{content_id}?storefrontId=1"
+            res = requests.get(api_url, headers=headers, timeout=6)
+            if res.status_code == 200:
+                data = res.json().get("result", {})
+                if data.get("name"):
+                    brand = data.get("brand", {}).get("name", "")
+                    urun_adi = f"{brand} {data.get('name')}".strip()
+                
+                price_obj = data.get("price", {})
+                fiyat = price_obj.get("discountedPrice", {}).get("value") or \
+                        price_obj.get("sellingPrice", {}).get("value") or \
+                        price_obj.get("originalPrice", {}).get("value") or 0.0
+                
+                variants = data.get("variants", [])
+                if variants:
+                    stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
+        except Exception as api_err:
+            print("API Sorgu Hatası:", api_err)
+
+    # 2. Yöntem: Sayfa HTML İçinden JSON-LD / Microdata Parse Etme
+    if fiyat == 0.0:
+        try:
+            res_html = requests.get(clean_url, headers=headers, timeout=8)
+            if res_html.status_code == 200:
+                html = res_html.text
+                
+                # State JSON
+                match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
+                if match:
                     data = json.loads(match.group(1))
                     product = data.get("product", {})
-                    
                     if product.get("name"):
                         urun_adi = product.get("name")
-                    
                     price_obj = product.get("price", {})
                     fiyat = price_obj.get("discountedPrice", {}).get("value") or \
-                            price_obj.get("sellingPrice", {}).get("value") or \
-                            price_obj.get("originalPrice", {}).get("value") or 0.0
-                    
+                            price_obj.get("sellingPrice", {}).get("value") or 0.0
                     variants = product.get("variants", [])
                     if variants:
                         stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
-                except Exception as json_err:
-                    print("JSON Parse Hatası:", json_err)
 
-            # 2. Yöntem: Regex Fallback
-            if fiyat == 0.0:
-                price_match = re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html) or re.search(r'"price":\s*([\d\.]+)', html)
-                if price_match:
-                    fiyat = float(price_match.group(1))
-
-            # Title içinden başlık çekme
-            if urun_adi == "Trendyol Takip Ürünü":
-                title_match = re.search(r'<title>(.*?)</title>', html)
-                if title_match:
-                    extracted_title = title_match.group(1).split('|')[0].replace("- Trendyol", "").strip()
-                    if extracted_title:
-                        urun_adi = extracted_title
-
-    except Exception as e:
-        print(f"Scrape Hatası ({clean_url}): {e}")
+                # Regex Fallback Fiyat
+                if fiyat == 0.0:
+                    price_match = re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html) or \
+                                  re.search(r'"price":\s*([\d\.]+)', html) or \
+                                  re.search(r'itemprop="price"\s+content="([\d\.]+)"', html)
+                    if price_match:
+                        fiyat = float(price_match.group(1))
+        except Exception as html_err:
+            print("HTML Parse Hatası:", html_err)
 
     return {
         "urun_adi": str(urun_adi)[:80],
@@ -155,7 +173,7 @@ def trendyol_veri_cek(raw_url):
         "stok": int(stok) if stok else 0
     }
 
-# --- PAZAR ANALİZİ ENGINE ---
+# --- PAZAR ANALİZİ ALGORİTMASI ---
 def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     fiyat = fiyat or 0.0
     toplam_satis = toplam_satis or 0
@@ -169,7 +187,7 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     elif toplam_satis == 0:
         risk_puan += 15
         
-    if fiyat > 0 and fiyat < 100:
+    if 0 < fiyat < 100:
         risk_puan += 10
     elif fiyat > 500:
         risk_puan -= 10
@@ -206,7 +224,7 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
         "trend_renk": trend_renk
     }
 
-# --- HTML ŞABLONU ---
+# --- ARAYÜZ (HTML) ---
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="tr">
@@ -340,16 +358,26 @@ def index():
 @app.route('/ekle', methods=['POST'])
 def ekle():
     try:
-        url = request.form.get('url', '').strip()
-        if url:
-            veri = trendyol_veri_cek(url)
+        raw_url = request.form.get('url', '').strip()
+        if raw_url:
+            clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
+            veri = trendyol_veri_cek(clean_url)
+            
             conn = get_db()
             cursor = conn.cursor()
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Ürün zaten varsa fiyat/stok güncelle, yoksa yeni ekle
             cursor.execute('''
-                INSERT OR REPLACE INTO urunler (url, urun_adi, fiyat, son_stok, son_guncelleme)
+                INSERT INTO urunler (url, urun_adi, fiyat, son_stok, son_guncelleme)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (url, veri['urun_adi'], veri['fiyat'], veri['stok'], now))
+                ON CONFLICT(url) DO UPDATE SET
+                    urun_adi=excluded.urun_adi,
+                    fiyat=CASE WHEN excluded.fiyat > 0 THEN excluded.fiyat ELSE urunler.fiyat END,
+                    son_stok=CASE WHEN excluded.son_stok > 0 THEN excluded.son_stok ELSE urunler.son_stok END,
+                    son_guncelleme=excluded.son_guncelleme
+            ''', (clean_url, veri['urun_adi'], veri['fiyat'], veri['stok'], now))
+            
             conn.commit()
             conn.close()
     except Exception as e:
