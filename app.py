@@ -47,7 +47,7 @@ def eposta_gonder(urun_adi, fiyat, stok, satis_adedi, ciro, url):
     except Exception as e:
         print(f"E-posta gönderme hatası: {e}")
 
-# --- VERİTABANI OLUŞTURMA & OTOMATİK MİGRASYON ---
+# --- VERİTABANI OLUŞTURMA ---
 def get_db():
     conn = sqlite3.connect('trendyol_takip.db')
     conn.row_factory = sqlite3.Row
@@ -68,67 +68,61 @@ def init_db():
             son_guncelleme TEXT
         )
     ''')
-    
-    # Eksik sütun kontrolü ve otomatik ekleme
-    cursor.execute("PRAGMA table_info(urunler)")
-    columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'fiyat' not in columns:
-        cursor.execute("ALTER TABLE urunler ADD COLUMN fiyat REAL DEFAULT 0.0")
-    if 'son_stok' not in columns:
-        cursor.execute("ALTER TABLE urunler ADD COLUMN son_stok INTEGER DEFAULT 0")
-    if 'toplam_satis' not in columns:
-        cursor.execute("ALTER TABLE urunler ADD COLUMN toplam_satis INTEGER DEFAULT 0")
-    if 'toplam_ciro' not in columns:
-        cursor.execute("ALTER TABLE urunler ADD COLUMN toplam_ciro REAL DEFAULT 0.0")
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stok_gecmisi (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            urun_id INTEGER,
-            tarih TEXT,
-            fiyat REAL,
-            stok INTEGER,
-            FOREIGN KEY (urun_id) REFERENCES urunler (id)
-        )
-    ''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- VERİ ÇEKME FONKSİYONU ---
+# --- GELİŞMİŞ TRENDYOL SCRAPER ---
 def trendyol_veri_cek(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
     }
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers=headers, timeout=12)
         if res.status_code != 200:
             return None
         
         html = res.text
+        
+        # 1. Yöntem: Window State JSON Parse
         match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
-        if not match:
-            return None
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                product = data.get("product", {})
+                
+                urun_adi = product.get("name", "")
+                
+                # Fiyat Yakalama
+                price_obj = product.get("price", {})
+                fiyat = price_obj.get("discountedPrice", {}).get("value") or \
+                        price_obj.get("sellingPrice", {}).get("value") or \
+                        price_obj.get("originalPrice", {}).get("value") or 0.0
+                
+                # Stok Yakalama
+                stok = None
+                variants = product.get("variants", [])
+                if variants:
+                    stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
+                
+                if urun_adi and fiyat > 0:
+                    return {"urun_adi": urun_adi, "fiyat": float(fiyat), "stok": stok if stok is not None else 0}
+            except Exception as e:
+                print("JSON parse hatası:", e)
+
+        # 2. Yöntem: HTML Metin Regex Fallback (JSON Başarısız Olursa)
+        title_match = re.search(r'<h1 class="pr-new-br"[^>]*>(.*?)</h1>', html) or re.search(r'<title>(.*?)</title>', html)
+        urun_adi = title_match.group(1).strip() if title_match else "Trendyol Ürünü"
         
-        data = json.loads(match.group(1))
-        product = data.get("product", {})
-        
-        urun_adi = product.get("name", "Bilinmeyen Ürün")
-        fiyat = product.get("price", {}).get("sellingPrice", {}).get("value", 0.0)
-        
-        stok = None
-        variants = product.get("variants", [])
-        if variants:
-            stok = sum([v.get("stock", 0) for v in variants])
-        elif "stok" in product:
-            stok = product.get("stok")
+        price_match = re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html) or re.search(r'"discountedPrice":\s*\{\s*"value":\s*([\d\.]+)', html)
+        fiyat = float(price_match.group(1)) if price_match else 0.0
 
         return {
             "urun_adi": urun_adi,
             "fiyat": fiyat,
-            "stok": stok
+            "stok": 0
         }
     except Exception as e:
         print(f"Scrape Hatası ({url}): {e}")
@@ -139,13 +133,10 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     fiyat = fiyat or 0.0
     toplam_satis = toplam_satis or 0
     
-    # 1. Aylık Tahmini Satış & Ciro
     aylik_tahmini_satis = max(toplam_satis * 4, 0) if toplam_satis > 0 else 0
     aylik_tahmini_ciro = aylik_tahmini_satis * fiyat
 
-    # 2. Pazara Giriş Risk Skoru (1 - 100 Arası)
     risk_puan = 50
-    
     if toplam_satis > 15:
         risk_puan -= 20
     elif toplam_satis == 0:
@@ -155,9 +146,6 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
         risk_puan += 10
     elif fiyat > 500:
         risk_puan -= 10
-
-    if stok is not None and stok == 0:
-        risk_puan += 20
 
     risk_puan = max(1, min(99, risk_puan))
     
@@ -171,7 +159,6 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
         risk_etiketi = "Yüksek Risk"
         risk_renk = "#e74c3c"
 
-    # 3. Trend Yönü
     if toplam_satis > 5:
         trend = "🚀 Yükselişte (Yüksek Talep)"
         trend_renk = "#27ae60"
@@ -220,7 +207,6 @@ HTML_TEMPLATE = '''
     </nav>
 
     <div class="container mb-5">
-        <!-- ÜRÜN EKLEME KART -->
         <div class="card p-4 mb-4">
             <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-plus-circle me-2"></i>Takibe & Analize Yeni Ürün Ekle</h5>
             <form action="/ekle" method="POST" class="row g-3">
@@ -233,24 +219,21 @@ HTML_TEMPLATE = '''
             </form>
         </div>
 
-        <!-- ÜRÜN LİSTESİ VE PAZAR ANALİZLERİ -->
         <h4 class="fw-bold mb-3 text-dark"><i class="fa-solid fa-chart-line me-2"></i>Takip Edilen Ürünler ve Pazar Analizi</h4>
         
         {% if urunler %}
             {% for u in urunler %}
             <div class="card p-3 mb-3">
                 <div class="row align-items-center">
-                    <!-- ÜRÜN TEMEL BİLGİSİ -->
                     <div class="col-md-4">
-                        <h6 class="fw-bold text-truncate mb-1" title="{{ u.urun_adi }}">{{ u.urun_adi }}</h6>
+                        <h6 class="fw-bold text-truncate mb-1" title="{{ u.urun_adi }}">{{ u.urun_adi if u.urun_adi else 'İsimsiz Ürün' }}</h6>
                         <a href="{{ u.url }}" target="_blank" class="text-decoration-none small text-muted"><i class="fa-solid fa-arrow-up-right-from-square me-1"></i>Trendyol'da İncele</a>
                         <div class="mt-2">
                             <span class="me-3"><strong>Fiyat:</strong> <span class="text-success fw-bold">{{ u.fiyat }} TL</span></span>
-                            <span><strong>Kalan Stok:</strong> {{ u.son_stok if u.son_stok is not none else 'Bilinmiyor' }}</span>
+                            <span><strong>Kalan Stok:</strong> {{ u.son_stok }}</span>
                         </div>
                     </div>
 
-                    <!-- REEL GERÇEKLEŞEN TAKİP -->
                     <div class="col-md-3 border-start border-end">
                         <div class="row text-center">
                             <div class="col-6">
@@ -264,7 +247,6 @@ HTML_TEMPLATE = '''
                         </div>
                     </div>
 
-                    <!-- PAZAR ANALİZİ VE PROJEKSİYON -->
                     <div class="col-md-4">
                         <div class="p-2 rounded" style="background-color: #f8f9fa;">
                             <div class="d-flex justify-content-between align-items-center mb-1">
@@ -284,9 +266,8 @@ HTML_TEMPLATE = '''
                         </div>
                     </div>
 
-                    <!-- İŞLEM -->
                     <div class="col-md-1 text-end">
-                        <a href="/sil/{{ u.id }}" class="btn btn-outline-danger btn-sm" onclick="return confirm('Bu ürünü takipten çıkarmak istediğinize emin misiniz?')" title="Sil">
+                        <a href="/sil/{{ u.id }}" class="btn btn-outline-danger btn-sm" onclick="return confirm('Bu ürünü silmek istediğinize emin misiniz?')" title="Sil">
                             <i class="fa-solid fa-trash-can"></i>
                         </a>
                     </div>
@@ -314,12 +295,10 @@ def index():
     urunler = []
     for r in rows:
         u = dict(r)
-        
-        # GÜVENLİ VERİ ÇEKME (.get kullanımı)
-        satis = u.get('toplam_satis', 0) or 0
-        ciro = u.get('toplam_ciro', 0.0) or 0.0
-        fiyat = u.get('fiyat', 0.0) or 0.0
-        stok = u.get('son_stok', 0)
+        satis = u.get('toplam_satis') or 0
+        ciro = u.get('toplam_ciro') or 0.0
+        fiyat = u.get('fiyat') or 0.0
+        stok = u.get('son_stok') or 0
         
         u['satis'] = satis
         u['ciro'] = ciro
@@ -362,12 +341,13 @@ def tarat():
         u = dict(r)
         yeni = trendyol_veri_cek(u.get('url', ''))
         
-        toplam_satis = u.get('toplam_satis', 0) or 0
-        toplam_ciro = u.get('toplam_ciro', 0.0) or 0.0
+        if yeni and yeni['fiyat'] > 0:
+            toplam_satis = u.get('toplam_satis') or 0
+            toplam_ciro = u.get('toplam_ciro') or 0.0
+            eski_stok = u.get('son_stok') or 0
 
-        if yeni and yeni['stok'] is not None and u.get('son_stok') is not None:
-            if yeni['stok'] < u['son_stok']:
-                satis_adedi = u['son_stok'] - yeni['stok']
+            if yeni['stok'] < eski_stok and eski_stok > 0:
+                satis_adedi = eski_stok - yeni['stok']
                 ek_ciro = satis_adedi * yeni['fiyat']
                 
                 yeni_toplam_satis = toplam_satis + satis_adedi
@@ -376,16 +356,16 @@ def tarat():
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 cursor.execute('''
                     UPDATE urunler 
-                    SET fiyat=?, son_stok=?, toplam_satis=?, toplam_ciro=?, son_guncelleme=?
+                    SET urun_adi=?, fiyat=?, son_stok=?, toplam_satis=?, toplam_ciro=?, son_guncelleme=?
                     WHERE id=?
-                ''', (yeni['fiyat'], yeni['stok'], yeni_toplam_satis, yeni_toplam_ciro, now, u['id']))
+                ''', (yeni['urun_adi'], yeni['fiyat'], yeni['stok'], yeni_toplam_satis, yeni_toplam_ciro, now, u['id']))
                 
                 conn.commit()
                 eposta_gonder(yeni['urun_adi'], yeni['fiyat'], yeni['stok'], satis_adedi, ek_ciro, u['url'])
             else:
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                cursor.execute("UPDATE urunler SET fiyat=?, son_stok=?, son_guncelleme=? WHERE id=?", 
-                               (yeni['fiyat'], yeni['stok'], now, u['id']))
+                cursor.execute("UPDATE urunler SET urun_adi=?, fiyat=?, son_stok=?, son_guncelleme=? WHERE id=?", 
+                               (yeni['urun_adi'], yeni['fiyat'], yeni['stok'], now, u['id']))
                 conn.commit()
 
     conn.close()
