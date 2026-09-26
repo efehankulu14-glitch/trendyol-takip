@@ -1,7 +1,8 @@
 from flask import Flask, render_template_string, request, redirect, url_for
 import sqlite3
-import asyncio
-from playwright.async_api import async_playwright
+import re
+import json
+from curl_cffi import requests as crequests
 from datetime import datetime
 
 app = Flask(__name__)
@@ -38,52 +39,38 @@ def init_db():
 
 init_db()
 
-async def fetch_with_playwright(product_url):
+def fetch_with_curl_cffi(product_url):
     clean_url = product_url.split('?')[0] if '?' in product_url else product_url
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
-        )
-        page = await context.new_page()
+    try:
+        # Chrome TLS parmak izi taklidi ile Cloudflare'i baypas ediyoruz
+        response = crequests.get(clean_url, impersonate="chrome", timeout=15)
         
-        try:
-            await page.goto(clean_url, timeout=30000, wait_until="domcontentloaded")
+        if response.status_code != 200:
+            return {"success": False, "error": f"HTTP Kod: {response.status_code}"}
+        
+        match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', response.text, re.DOTALL)
+        if match:
+            data = json.loads(match.group(1))
+            product = data.get('product', {})
             
-            product_data = await page.evaluate('''() => {
-                if (window.__PRODUCT_DETAIL_APP_INITIAL_STATE__) {
-                    return window.__PRODUCT_DETAIL_APP_INITIAL_STATE__.product;
-                }
-                return null;
-            }''')
+            title = product.get('name', 'Trendyol Ürünü')
+            price_info = product.get('price', {})
+            price = price_info.get('sellingPrice', {}).get('value') or price_info.get('discountedPrice', {}).get('value') or 0.0
             
-            await browser.close()
+            rating_count = int(product.get('ratingCount', 0))
+            favorite_count = int(product.get('favoriteCount', 0))
             
-            if product_data:
-                title = product_data.get('name', 'Trendyol Ürünü')
-                price_info = product_data.get('price', {})
-                price = price_info.get('sellingPrice', {}).get('value') or price_info.get('discountedPrice', {}).get('value') or 0.0
-                rating_count = int(product_data.get('ratingCount', 0))
-                favorite_count = int(product_data.get('favoriteCount', 0))
-                
-                return {
-                    "success": True,
-                    "title": title,
-                    "price": float(price),
-                    "ratingCount": rating_count,
-                    "favoriteCount": favorite_count,
-                    "msg": "Playwright Tarayıcı ile Otomatik Çekildi ✅"
-                }
-            else:
-                return {"success": False, "error": "State objesi sayfada bulunamadı"}
-                
-        except Exception as e:
-            await browser.close()
-            return {"success": False, "error": str(e)}
+            return {
+                "success": True,
+                "title": title,
+                "price": float(price),
+                "ratingCount": rating_count,
+                "favoriteCount": favorite_count,
+                "msg": "curl_cffi ile Başarıyla Çekildi ✅"
+            }
+        return {"success": False, "error": "State JSON verisi sayfada bulunamadı"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.route('/')
 def index():
@@ -120,11 +107,7 @@ def ekle():
     raw_url = request.form.get('url', '').strip()
     if raw_url:
         clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        res = loop.run_until_complete(fetch_with_playwright(clean_url))
-        loop.close()
+        res = fetch_with_curl_cffi(clean_url)
         
         if res["success"]:
             urun_adi = res["title"]
@@ -188,7 +171,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trendyol SaaS - Otomasyon Paneli</title>
+    <title>Trendyol SaaS - curl_cffi Otomasyonu</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -204,7 +187,7 @@ HTML_TEMPLATE = '''
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
             <span class="navbar-brand mb-0 h1"><i class="fa-solid fa-chart-line me-2"></i>Trendyol Akıllı Pazar Analiz Sistemi</span>
-            <span class="text-white small fw-bold"><i class="fa-solid fa-robot me-1"></i>Playwright Docker Otomasyonu Aktif</span>
+            <span class="text-white small fw-bold"><i class="fa-solid bolt me-1"></i>Hafif curl_cffi Otomasyonu Aktif</span>
         </div>
     </nav>
     <div class="container mb-5">
