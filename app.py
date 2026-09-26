@@ -1,12 +1,13 @@
 from flask import Flask, render_template_string, request, redirect, url_for
 import sqlite3
+import re
+import json
 from datetime import datetime
-from urllib.parse import urlparse, unquote
-import random
+import cloudscraper
 
 app = Flask(__name__)
 
-DB_NAME = 'trendyol_takip_v6.db'
+DB_NAME = 'trendyol_takip_v7.db'
 
 def get_db():
     conn = sqlite3.connect(DB_NAME)
@@ -39,6 +40,57 @@ def init_db():
 
 init_db()
 
+def fetch_trendyol_product_data(product_url):
+    """Cloudflare korumasını aşarak Trendyol sayfasından gerçek verileri çeker."""
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'custom': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        }
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    
+    try:
+        clean_url = product_url.split('?')[0] if '?' in product_url else product_url
+        response = scraper.get(clean_url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            return {"success": False, "error": f"Trendyol sayfasına erişilemedi (Kod: {response.status_code})"}
+        
+        html_content = response.text
+        
+        # Trendyol'un gömülü JSON state verisini yakala
+        match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html_content, re.DOTALL)
+        if not match:
+            match = re.search(r'__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});</script>', html_content, re.DOTALL)
+            
+        if match:
+            json_str = match.group(1)
+            data = json.loads(json_str)
+            product = data.get('product', {})
+            
+            title = product.get('name', 'Trendyol Ürünü')
+            price_info = product.get('price', {})
+            price = price_info.get('sellingPrice', {}).get('value') or price_info.get('discountedPrice', {}).get('value') or 0.0
+            
+            rating_count = product.get('ratingCount', 0) # Gerçek Değerlendirme Sayısı
+            review_count = product.get('reviewCount', 0) # Yorum Sayısı
+            favorite_count = product.get('favoriteCount', 0) # Favori Sayısı
+            
+            return {
+                "success": True,
+                "title": title,
+                "price": float(price),
+                "ratingCount": int(rating_count),
+                "reviewCount": int(review_count),
+                "favoriteCount": int(favorite_count)
+            }
+        else:
+            return {"success": False, "error": "Ürün state verisi çözümlenemedi."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 @app.route('/')
 def index():
     conn = get_db()
@@ -50,22 +102,22 @@ def index():
     for r in rows:
         u = dict(r)
         fiyat = u.get('fiyat') or 0.0
-        toplam_satis = u.get('toplam_satis') or 0
+        yorum_sayisi = u.get('yorum_sayisi') or 0
         
-        aylik_tahmini_satis = max(int(toplam_satis * 1.3), 20)
-        aylik_tahmini_ciro = aylik_tahmini_satis * fiyat
+        toplam_satis = max(int(yorum_sayisi * 3.5), 15)
+        toplam_ciro = toplam_satis * fiyat
 
-        risk_puan = 35 if toplam_satis > 100 else 55
+        risk_puan = 35 if yorum_sayisi > 500 else 60
         risk_etiketi = "Yüksek Talep / Fırsat" if risk_puan < 50 else "Orta Risk"
         risk_renk = "#27ae60" if risk_puan < 50 else "#f39c12"
 
         u['analiz'] = {
-            "aylik_satis": aylik_tahmini_satis,
-            "aylik_ciro": aylik_tahmini_ciro,
+            "aylik_satis": toplam_satis,
+            "aylik_ciro": toplam_ciro,
             "risk_skoru": risk_puan,
             "risk_etiketi": risk_etiketi,
             "risk_renk": risk_renk,
-            "trend": "🔥 Çok Satan Trend" if toplam_satis > 80 else "🚀 Artışta",
+            "trend": "🔥 Çok Satan Trend" if yorum_sayisi > 200 else "🚀 Artışta",
             "trend_renk": "#27ae60"
         }
         urunler.append(u)
@@ -80,31 +132,27 @@ def ekle():
         if raw_url:
             clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
             
-            # Ürün adını URL'den tertemiz çıkar
-            urun_adi = "Trendyol Pazar Ürünü"
-            try:
-                parsed = urlparse(clean_url)
-                path = parsed.path.strip('/')
-                parts = path.split('/')
-                for part in parts:
-                    if '-p-' in part:
-                        slug = part.split('-p-')[0]
-                        clean_name = unquote(slug).replace('-', ' ').title()
-                        if clean_name:
-                            urun_adi = clean_name[:65]
-                            break
-            except Exception:
-                pass
-
-            # Formdan gelen değerler veya akıllı varsayılanlar/simülasyon
-            fiyat = float(request.form.get('fiyat', 0) or random.uniform(49.90, 249.90))
-            toplam_satis = int(request.form.get('toplam_satis', 0) or random.randint(120, 650))
-            sepet_sayisi = int(request.form.get('sepet_sayisi', 0) or random.randint(350, 1500))
-            favori_sayisi = int(request.form.get('favori_sayisi', 0) or random.randint(1500, 8500))
-            yorum_sayisi = int(request.form.get('yorum_sayisi', 0) or random.randint(45, 320))
+            # Otomatik Trendyol Kazıma İşlemi
+            res = fetch_trendyol_product_data(clean_url)
             
-            toplam_ciro = toplam_satis * fiyat
-            pazar_mesaji = "Başarıyla Analiz Edildi ve Kaydedildi"
+            if res["success"]:
+                urun_adi = res["title"]
+                fiyat = res["price"]
+                yorum_sayisi = res["ratingCount"]
+                favori_sayisi = res["favoriteCount"]
+                sepet_sayisi = max(int(favori_sayisi * 0.12), 15)
+                toplam_satis = max(int(yorum_sayisi * 3.5), 20)
+                toplam_ciro = toplam_satis * fiyat
+                pazar_mesaji = "Trendyol'dan Canlı ve Gerçek Çekildi"
+            else:
+                urun_adi = "Trendyol Ürünü (Yedek)"
+                fiyat = 118.00
+                yorum_sayisi = 0
+                favori_sayisi = 0
+                sepet_sayisi = 0
+                toplam_satis = 15
+                toplam_ciro = toplam_satis * fiyat
+                pazar_mesaji = f"Hata: {res.get('error', 'Bilinmeyen hata')}"
 
             conn = get_db()
             cursor = conn.cursor()
@@ -166,35 +214,18 @@ HTML_TEMPLATE = '''
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
             <span class="navbar-brand mb-0 h1"><i class="fa-solid fa-chart-line me-2"></i>Trendyol Akıllı Pazar Analiz Sistemi</span>
-            <span class="text-white small fw-bold"><i class="fa-solid fa-shield-check me-1"></i>Stabil Hibrit Mod Aktif</span>
+            <span class="text-white small fw-bold"><i class="fa-solid fa-bolt me-1"></i>Tam Otomatik Mod Aktif</span>
         </div>
     </nav>
 
     <div class="container mb-5">
         <div class="card p-4 mb-4">
-            <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-link me-2"></i>Trendyol Ürün Linki ile Pazar Analizi Ekle</h5>
+            <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-link me-2"></i>Trendyol Ürün Linkini Yapıştır ve Otomatik Analiz Et</h5>
             <form action="/ekle" method="POST" class="row g-3">
-                <div class="col-md-12">
-                    <label class="form-label small fw-bold text-muted">Ürün Linki</label>
+                <div class="col-md-10">
                     <input type="url" name="url" class="form-control form-control-lg" placeholder="https://www.trendyol.com/..." required>
                 </div>
-                <div class="col-md-3">
-                    <label class="form-label small fw-bold text-muted">Birim Fiyat (TL) (Opsiyonel)</label>
-                    <input type="number" step="0.01" name="fiyat" class="form-control" placeholder="Boş bırakırsanız otomatik belirlenir">
-                </div>
-                <div class="col-md-3">
-                    <label class="form-label small fw-bold text-muted">Tahmini Satış Adedi (Opsiyonel)</label>
-                    <input type="number" name="toplam_satis" class="form-control" placeholder="Örn: 250">
-                </div>
-                <div class="col-md-2">
-                    <label class="form-label small fw-bold text-muted">Sepetteki Kişi</label>
-                    <input type="number" name="sepet_sayisi" class="form-control" placeholder="Örn: 450">
-                </div>
-                <div class="col-md-2">
-                    <label class="form-label small fw-bold text-muted">Yorum Sayısı</label>
-                    <input type="number" name="yorum_sayisi" class="form-control" placeholder="Örn: 120">
-                </div>
-                <div class="col-md-2 d-grid align-items-end">
+                <div class="col-md-2 d-grid">
                     <button type="submit" class="btn btn-warning text-white fw-bold py-2" style="background-color: #f27a1a;"><i class="fa-solid fa-bolt me-1"></i> Analiz Et</button>
                 </div>
             </form>
@@ -266,10 +297,13 @@ HTML_TEMPLATE = '''
             {% endfor %}
         {% else %}
             <div class="alert alert-secondary text-center p-4">
-                Henüz ürün eklenmedi. Linki yapıştırıp istersen fiyat/satış girerek ya da doğrudan ekleyerek harika pazar analizini hemen gör!
+                Henüz ürün eklenmedi. Trendyol linkini yapıştır, saniyesinde gerçek verileri çekelim!
             </div>
         {% endif %}
     </div>
 </body>
 </html>
 '''
+
+if __name__ == '__main__':
+    app.run(debug=True)
