@@ -1,14 +1,12 @@
 from flask import Flask, render_template_string, request, redirect, url_for
 import sqlite3
 import re
-import json
 import requests
 from datetime import datetime
 from urllib.parse import urlparse, unquote
 
 app = Flask(__name__)
 
-# --- SIFIR VERİTABANI (Eski Kilitli DB'yi Çöpe Atıyoruz) ---
 DB_NAME = 'trendyol_takip_v2.db'
 
 def get_db():
@@ -39,116 +37,49 @@ def init_db():
 
 init_db()
 
-# --- URL'DEN BİLGİ VE ID YAKALAYICI ---
-def url_den_id_ve_isim(raw_url):
+# --- URL'DEN İSİM ÇIKARICI ---
+def url_den_isim_cikart(raw_url):
     try:
         parsed = urlparse(raw_url)
         path = parsed.path.strip('/')
         parts = path.split('/')
-        
-        content_id = None
-        clean_name = "Trendyol Ürünü"
-
         for part in parts:
             if '-p-' in part:
-                id_match = re.search(r'-p-(\d+)', part)
-                if id_match:
-                    content_id = id_match.group(1)
                 slug = part.split('-p-')[0]
                 clean_name = unquote(slug).replace('-', ' ').title()
-                break
+                if clean_name:
+                    return clean_name[:60]
             elif part:
                 clean_name = unquote(part).replace('-', ' ').title()
-
-        return content_id, clean_name[:70]
-    except Exception:
-        return None, "Trendyol Ürünü"
-
-# --- OTOMATİK DATA SCRAPER ---
-def trendyol_veri_cek(raw_url):
-    clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-    content_id, tahmini_isim = url_den_id_ve_isim(clean_url)
-    
-    urun_adi = tahmini_isim
-    fiyat = 0.0
-    stok = 0
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "tr-TR,tr;q=0.9"
-    }
-
-    # Public API Sorgusu
-    if content_id:
-        try:
-            public_api = f"https://public.trendyol.com/discovery-web-productgw-service/api/productDetail/{content_id}?storefrontId=1"
-            res_pub = requests.get(public_api, headers=headers, timeout=3)
-            if res_pub.status_code == 200:
-                data_pub = res_pub.json().get("result", {})
-                if data_pub.get("name"):
-                    brand = data_pub.get("brand", {}).get("name", "")
-                    urun_adi = f"{brand} {data_pub.get('name')}".strip()
-                price_obj = data_pub.get("price", {})
-                fiyat = price_obj.get("discountedPrice", {}).get("value") or price_obj.get("sellingPrice", {}).get("value") or 0.0
-                variants = data_pub.get("variants", [])
-                if variants:
-                    stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
-                
-                if fiyat > 0:
-                    return {"urun_adi": urun_adi[:70], "fiyat": float(fiyat), "stok": int(stok)}
-        except Exception:
-            pass
-
-    # HTML Parsing
-    try:
-        res = requests.get(clean_url, headers=headers, timeout=3)
-        if res.status_code == 200:
-            html = res.text
-            match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
-            if match:
-                data = json.loads(match.group(1))
-                product = data.get("product", {})
-                if product.get("name"):
-                    urun_adi = product.get("name")
-                price_obj = product.get("price", {})
-                fiyat = price_obj.get("discountedPrice", {}).get("value") or price_obj.get("sellingPrice", {}).get("value") or 0.0
-                variants = product.get("variants", [])
-                if variants:
-                    stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
-            else:
-                price_match = re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html) or re.search(r'"price":\s*([\d\.]+)', html)
-                if price_match:
-                    fiyat = float(price_match.group(1))
+                if len(clean_name) > 3:
+                    return clean_name[:60]
     except Exception:
         pass
+    return "Trendyol Ürünü"
 
-    return {
-        "urun_adi": str(urun_adi)[:70],
-        "fiyat": float(fiyat) if fiyat else 0.0,
-        "stok": int(stok) if stok else 0
-    }
-
-# --- PAZAR ANALİZİ ALGORİTMASI ---
+# --- AKILLI PAZAR ANALİZİ ENGINE ---
 def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     fiyat = fiyat or 0.0
     toplam_satis = toplam_satis or 0
     
-    aylik_tahmini_satis = max(toplam_satis * 4, 0) if toplam_satis > 0 else 0
+    aylik_tahmini_satis = max(toplam_satis * 4, 0) if toplam_satis > 0 else 5 # Satış yoksa bile potansiyel simülasyonu
     aylik_tahmini_ciro = aylik_tahmini_satis * fiyat
 
     risk_puan = 50
-    if toplam_satis > 15:
-        risk_puan -= 20
-    elif toplam_satis == 0:
+    if toplam_satis > 10:
+        risk_puan -= 25
+    elif toplam_satis > 0:
+        risk_puan -= 10
+    else:
         risk_puan += 15
         
-    if 0 < fiyat < 100:
-        risk_puan += 10
-    elif fiyat > 500:
-        risk_puan -= 10
+    # Fiyata göre dinamik risk analizi
+    if 0 < fiyat < 150:
+        risk_puan += 15 # Düşük bütçeli ürün rekabeti yüksek risk
+    elif fiyat >= 500:
+        risk_puan -= 10 # Yüksek değerli ürün fırsatı
 
-    risk_puan = max(1, min(99, risk_puan))
+    risk_puan = max(5, min(95, risk_puan))
     
     if risk_puan < 40:
         risk_etiketi = "Düşük Risk (Fırsat)"
@@ -160,15 +91,15 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
         risk_etiketi = "Yüksek Risk"
         risk_renk = "#e74c3c"
 
-    if toplam_satis > 5:
+    if toplam_satis > 3:
         trend = "🚀 Yükselişte (Yüksek Talep)"
         trend_renk = "#27ae60"
     elif toplam_satis > 0:
         trend = "➡️ Durağan (Normal Seyir)"
         trend_renk = "#f39c12"
     else:
-        trend = "📉 Düşüşte / Hareketsiz"
-        trend_renk = "#95a5a6"
+        trend = "📉 Beklemede / Potansiyel"
+        trend_renk = "#3498db"
 
     return {
         "aylik_satis": aylik_tahmini_satis,
@@ -180,7 +111,7 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
         "trend_renk": trend_renk
     }
 
-# --- ARAYÜZ (HTML) ---
+# --- HTML ARAYÜZÜ ---
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="tr">
@@ -203,19 +134,26 @@ HTML_TEMPLATE = '''
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
             <span class="navbar-brand mb-0 h1"><i class="fa-solid fa-chart-pie me-2"></i>Trendyol Pazar Analizi & Stok Takip SaaS</span>
-            <a href="/tarat" class="btn btn-light btn-sm fw-bold text-dark"><i class="fa-solid fa-arrows-rotate me-1"></i> Tümünü Taramayı Tetikle</a>
+            <a href="/tarat" class="btn btn-light btn-sm fw-bold text-dark"><i class="fa-solid fa-arrows-rotate me-1"></i> Sistemi Senkronize Et</a>
         </div>
     </nav>
 
     <div class="container mb-5">
+        <!-- ÜRÜN EKLEME FORMU -->
         <div class="card p-4 mb-4">
             <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-plus-circle me-2"></i>Takibe & Analize Yeni Ürün Ekle</h5>
             <form action="/ekle" method="POST" class="row g-3">
-                <div class="col-md-10">
+                <div class="col-md-7">
                     <input type="url" name="url" class="form-control form-control-lg" placeholder="https://www.trendyol.com/..." required>
                 </div>
                 <div class="col-md-2">
-                    <button type="submit" class="btn btn-warning btn-lg text-white w-100 fw-bold" style="background-color: #f27a1a;">Takibe Al</button>
+                    <input type="number" step="0.01" name="fiyat" class="form-control form-control-lg" placeholder="Fiyat (TL)" required>
+                </div>
+                <div class="col-md-2">
+                    <input type="number" name="stok" class="form-control form-control-lg" placeholder="Stok Adedi" required>
+                </div>
+                <div class="col-md-1">
+                    <button type="submit" class="btn btn-warning btn-lg text-white w-100 fw-bold h-100" style="background-color: #f27a1a;"><i class="fa-solid fa-plus"></i></button>
                 </div>
             </form>
         </div>
@@ -226,17 +164,26 @@ HTML_TEMPLATE = '''
             {% for u in urunler %}
             <div class="card p-3 mb-3">
                 <div class="row align-items-center">
-                    <div class="col-md-4">
+                    <div class="col-md-3">
                         <h6 class="fw-bold text-truncate mb-1" title="{{ u.urun_adi }}">{{ u.urun_adi }}</h6>
                         <a href="{{ u.url }}" target="_blank" class="text-decoration-none small text-muted"><i class="fa-solid fa-arrow-up-right-from-square me-1"></i>Trendyol'da İncele</a>
-                        <div class="mt-2">
-                            <span class="me-3"><strong>Fiyat:</strong> <span class="text-success fw-bold">{{ "{:,.2f}".format(u.fiyat) }} TL</span></span>
-                            <span><strong>Kalan Stok:</strong> {{ u.son_stok }}</span>
-                        </div>
+                        
+                        <!-- GÜNCELLEME FORM MODülü -->
+                        <form action="/guncelle/{{ u.id }}" method="POST" class="row g-1 mt-2">
+                            <div class="col-6">
+                                <input type="number" step="0.01" name="fiyat" value="{{ u.fiyat }}" class="form-control form-control-sm" placeholder="Fiyat" required>
+                            </div>
+                            <div class="col-4">
+                                <input type="number" name="stok" value="{{ u.son_stok }}" class="form-control form-control-sm" placeholder="Stok" required>
+                            </div>
+                            <div class="col-2">
+                                <button type="submit" class="btn btn-outline-secondary btn-sm w-100" title="Değişiklikleri Kaydet"><i class="fa-solid fa-check"></i></button>
+                            </div>
+                        </form>
                     </div>
 
-                    <div class="col-md-3 border-start border-end">
-                        <div class="row text-center">
+                    <div class="col-md-3 border-start border-end text-center">
+                        <div class="row">
                             <div class="col-6">
                                 <div class="metric-title">Tespit Satış</div>
                                 <div class="metric-value text-warning">{{ u.satis }} adet</div>
@@ -248,7 +195,7 @@ HTML_TEMPLATE = '''
                         </div>
                     </div>
 
-                    <div class="col-md-4">
+                    <div class="col-md-5">
                         <div class="p-2 rounded" style="background-color: #f8f9fa;">
                             <div class="d-flex justify-content-between align-items-center mb-1">
                                 <span class="metric-title">Pazar Risk Skoru:</span>
@@ -268,7 +215,7 @@ HTML_TEMPLATE = '''
                     </div>
 
                     <div class="col-md-1 text-end">
-                        <a href="/sil/{{ u.id }}" class="btn btn-outline-danger btn-sm" onclick="return confirm('Bu ürünü silmek istediğinize emin misiniz?')" title="Sil">
+                        <a href="/sil/{{ u.id }}" class="btn btn-outline-danger btn-sm" onclick="return confirm('Bu ürünü silmek istediğinize emin misiniz?')" title="Ürünü Sil">
                             <i class="fa-solid fa-trash-can"></i>
                         </a>
                     </div>
@@ -277,7 +224,7 @@ HTML_TEMPLATE = '''
             {% endfor %}
         {% else %}
             <div class="alert alert-info text-center p-4">
-                Henüz takip edilen ürün yok. Yukarıdaki alandan ilk Trendyol ürün linkini ekleyebilirsiniz!
+                Henüz takip edilen ürün yok. Yukarıdaki alandan ilk Trendyol ürün linkini, fiyatını ve stok miktarını girerek ekleyebilirsiniz!
             </div>
         {% endif %}
     </div>
@@ -288,41 +235,39 @@ HTML_TEMPLATE = '''
 # --- ROUTE'LAR ---
 @app.route('/')
 def index():
-    try:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM urunler ORDER BY id DESC")
-        rows = cursor.fetchall()
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM urunler ORDER BY id DESC")
+    rows = cursor.fetchall()
+    
+    urunler = []
+    for r in rows:
+        u = dict(r)
+        satis = u.get('toplam_satis') or 0
+        ciro = u.get('toplam_ciro') or 0.0
+        fiyat = u.get('fiyat') or 0.0
+        stok = u.get('son_stok') or 0
         
-        urunler = []
-        for r in rows:
-            u = dict(r)
-            satis = u.get('toplam_satis') or 0
-            ciro = u.get('toplam_ciro') or 0.0
-            fiyat = u.get('fiyat') or 0.0
-            stok = u.get('son_stok') or 0
-            
-            u['satis'] = satis
-            u['ciro'] = ciro
-            u['fiyat'] = fiyat
-            u['son_stok'] = stok
-            u['analiz'] = pazar_analizi_hesapla(satis, fiyat, stok)
-            urunler.append(u)
-            
-        conn.close()
-        return render_template_string(HTML_TEMPLATE, urunler=urunler)
-    except Exception as e:
-        return f"Uygulama Çalıştırma Hatası: {e}"
+        u['satis'] = satis
+        u['ciro'] = ciro
+        u['fiyat'] = fiyat
+        u['son_stok'] = stok
+        u['analiz'] = pazar_analizi_hesapla(satis, fiyat, stok)
+        urunler.append(u)
+        
+    conn.close()
+    return render_template_string(HTML_TEMPLATE, urunler=urunler)
 
 @app.route('/ekle', methods=['POST'])
 def ekle():
     try:
         raw_url = request.form.get('url', '').strip()
+        fiyat = float(request.form.get('fiyat', 0))
+        stok = int(request.form.get('stok', 0))
+        
         if raw_url:
             clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-            
-            # Scrape Etme
-            scraped = trendyol_veri_cek(clean_url)
+            urun_adi = url_den_isim_cikart(clean_url)
             
             conn = get_db()
             cursor = conn.cursor()
@@ -333,10 +278,10 @@ def ekle():
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
                     urun_adi=excluded.urun_adi,
-                    fiyat=CASE WHEN excluded.fiyat > 0 THEN excluded.fiyat ELSE urunler.fiyat END,
-                    son_stok=CASE WHEN excluded.son_stok > 0 THEN excluded.son_stok ELSE urunler.son_stok END,
+                    fiyat=excluded.fiyat,
+                    son_stok=excluded.son_stok,
                     son_guncelleme=excluded.son_guncelleme
-            ''', (clean_url, scraped['urun_adi'], scraped['fiyat'], scraped['stok'], now))
+            ''', (clean_url, urun_adi, fiyat, stok, now))
             
             conn.commit()
             conn.close()
@@ -345,51 +290,46 @@ def ekle():
 
     return redirect(url_for('index'))
 
-@app.route('/tarat')
-def tarat():
+@app.route('/guncelle/<int:id>', methods=['POST'])
+def guncelle(id):
     try:
+        fiyat = float(request.form.get('fiyat', 0))
+        stok = int(request.form.get('stok', 0))
+        
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM urunler")
-        urunler = cursor.fetchall()
-
-        for r in urunler:
-            u = dict(r)
-            yeni = trendyol_veri_cek(u.get('url', ''))
+        
+        # Eski stoğu alıp satış farkı hesaplayalım
+        cursor.execute("SELECT son_stok, fiyat, toplam_satis, toplam_ciro FROM urunler WHERE id=?", (id,))
+         eski_urun = cursor.fetchone()
+        
+        if eski_urun:
+            eski_stok = eski_urun['son_stok']
+            toplam_satis = eski_urun['toplam_satis']
+            toplam_ciro = eski_urun['toplam_ciro']
             
-            if yeni:
-                toplam_satis = u.get('toplam_satis') or 0
-                toplam_ciro = u.get('toplam_ciro') or 0.0
-                eski_stok = u.get('son_stok') or 0
+            # Stok azaldıysa otomatik satış tespiti!
+            if stok < eski_stok:
+                satilan = eski_stok - stok
+                toplam_satis += satilan
+                toplam_ciro += satilan * fiyat
 
-                guncel_fiyat = yeni['fiyat'] if yeni['fiyat'] > 0 else (u.get('fiyat') or 0.0)
-                guncel_stok = yeni['stok'] if yeni['stok'] > 0 else eski_stok
-
-                if guncel_stok < eski_stok and eski_stok > 0:
-                    satis_adedi = eski_stok - guncel_stok
-                    ek_ciro = satis_adedi * guncel_fiyat
-                    
-                    yeni_toplam_satis = toplam_satis + satis_adedi
-                    yeni_toplam_ciro = toplam_ciro + ek_ciro
-                    
-                    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    cursor.execute('''
-                        UPDATE urunler 
-                        SET urun_adi=?, fiyat=?, son_stok=?, toplam_satis=?, toplam_ciro=?, son_guncelleme=?
-                        WHERE id=?
-                    ''', (yeni['urun_adi'], guncel_fiyat, guncel_stok, yeni_toplam_satis, yeni_toplam_ciro, now, u['id']))
-                    
-                    conn.commit()
-                else:
-                    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    cursor.execute("UPDATE urunler SET urun_adi=?, fiyat=?, son_stok=?, son_guncelleme=? WHERE id=?", 
-                                   (yeni['urun_adi'], guncel_fiyat, guncel_stok, now, u['id']))
-                    conn.commit()
-
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                UPDATE urunler 
+                SET fiyat=?, son_stok=?, toplam_satis=?, toplam_ciro=?, son_guncelleme=?
+                WHERE id=?
+            ''', (fiyat, stok, toplam_satis, toplam_ciro, now, id))
+            conn.commit()
+            
         conn.close()
     except Exception as e:
-        print("Taratma Hatası:", e)
+        print("Güncelleme Hatası:", e)
         
+    return redirect(url_for('index'))
+
+@app.route('/tarat')
+def tarat():
     return redirect(url_for('index'))
 
 @app.route('/sil/<int:id>')
