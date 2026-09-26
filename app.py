@@ -1,13 +1,11 @@
 from flask import Flask, render_template_string, request, redirect, url_for
 import sqlite3
-import re
-import json
-import requests
+import asyncio
+from playwright.async_api import async_playwright
 from datetime import datetime
-from urllib.parse import quote
 
 app = Flask(__name__)
-DB_NAME = 'trendyol_takip_v10.db'
+DB_NAME = 'trendyol_otomasyon.db'
 
 def get_db():
     conn = sqlite3.connect(DB_NAME)
@@ -40,57 +38,37 @@ def init_db():
 
 init_db()
 
-def fetch_trendyol_product_data(product_url):
+async def fetch_with_playwright(product_url):
     clean_url = product_url.split('?')[0] if '?' in product_url else product_url
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "tr-TR,tr;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
-    
-    html_content = ""
-    success = False
-    error_msg = ""
-
-    # 1. Adım: Doğrudan istek atmayı dene
-    try:
-        resp = requests.get(clean_url, headers=headers, timeout=10)
-        if resp.status_code == 200 and "window.__PRODUCT_DETAIL_APP_INITIAL_STATE__" in resp.text:
-            html_content = resp.text
-            success = True
-        else:
-            error_msg = f"Doğrudan HTTP {resp.status_code}"
-    except Exception as e:
-        error_msg = str(e)
-
-    # 2. Adım: Doğrudan 403 veya hata yerse, proxy köprüsü üzerinden geç (Render engelini aşmak için)
-    if not success:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        page = await context.new_page()
+        
         try:
-            proxy_api = f"https://api.allorigins.win/raw?url={quote(clean_url)}"
-            resp = requests.get(proxy_api, timeout=15)
-            if resp.status_code == 200 and "window.__PRODUCT_DETAIL_APP_INITIAL_STATE__" in resp.text:
-                html_content = resp.text
-                success = True
-                error_msg = "Proxy ile Canlı Çekildi"
-            else:
-                error_msg = f"Proxy HTTP {resp.status_code}"
-        except Exception as e:
-            error_msg = f"Proxy Hatası: {e}"
-
-    if success and html_content:
-        match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html_content, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group(1))
-                product = data.get('product', {})
-                
-                title = product.get('name', 'Trendyol Ürünü')
-                price_info = product.get('price', {})
+            await page.goto(clean_url, timeout=30000, wait_until="domcontentloaded")
+            
+            product_data = await page.evaluate('''() => {
+                if (window.__PRODUCT_DETAIL_APP_INITIAL_STATE__) {
+                    return window.__PRODUCT_DETAIL_APP_INITIAL_STATE__.product;
+                }
+                return null;
+            }''')
+            
+            await browser.close()
+            
+            if product_data:
+                title = product_data.get('name', 'Trendyol Ürünü')
+                price_info = product_data.get('price', {})
                 price = price_info.get('sellingPrice', {}).get('value') or price_info.get('discountedPrice', {}).get('value') or 0.0
-                
-                rating_count = int(product.get('ratingCount', 0))
-                favorite_count = int(product.get('favoriteCount', 0))
+                rating_count = int(product_data.get('ratingCount', 0))
+                favorite_count = int(product_data.get('favoriteCount', 0))
                 
                 return {
                     "success": True,
@@ -98,14 +76,14 @@ def fetch_trendyol_product_data(product_url):
                     "price": float(price),
                     "ratingCount": rating_count,
                     "favoriteCount": favorite_count,
-                    "msg": "Canlı Gerçek Veri Çekildi ✅"
+                    "msg": "Playwright Tarayıcı ile Otomatik Çekildi ✅"
                 }
-            except Exception as parse_err:
-                return {"success": False, "error": f"JSON Parse: {parse_err}"}
+            else:
+                return {"success": False, "error": "State objesi sayfada bulunamadı"}
                 
-        return {"success": False, "error": "JSON state bulunamadı"}
-    
-    return {"success": False, "error": error_msg}
+        except Exception as e:
+            await browser.close()
+            return {"success": False, "error": str(e)}
 
 @app.route('/')
 def index():
@@ -139,29 +117,33 @@ def index():
 
 @app.route('/ekle', methods=['POST'])
 def ekle():
-    try:
-        raw_url = request.form.get('url', '').strip()
-        if raw_url:
-            clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-            res = fetch_trendyol_product_data(clean_url)
-            
-            if res["success"]:
-                urun_adi = res["title"]
-                fiyat = res["price"]
-                yorum_sayisi = res["ratingCount"]
-                favori_sayisi = res["favoriteCount"]
-                pazar_mesaji = res["msg"]
-            else:
-                urun_adi = "Trendyol Ürünü (Hata)"
-                fiyat = 0.0
-                yorum_sayisi = 0
-                favori_sayisi = 0
-                pazar_mesaji = f"Hata: {res.get('error', 'Bilinmeyen')}"
+    raw_url = request.form.get('url', '').strip()
+    if raw_url:
+        clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        res = loop.run_until_complete(fetch_with_playwright(clean_url))
+        loop.close()
+        
+        if res["success"]:
+            urun_adi = res["title"]
+            fiyat = res["price"]
+            yorum_sayisi = res["ratingCount"]
+            favori_sayisi = res["favoriteCount"]
+            pazar_mesaji = res["msg"]
+        else:
+            urun_adi = "Trendyol Ürünü (Hata)"
+            fiyat = 0.0
+            yorum_sayisi = 0
+            favori_sayisi = 0
+            pazar_mesaji = f"Hata: {res.get('error', 'Bilinmeyen')}"
 
-            sepet_sayisi = max(int(favori_sayisi * 0.1), 5)
-            toplam_satis = max(int(yorum_sayisi * 3.5), 10)
-            toplam_ciro = toplam_satis * fiyat
+        sepet_sayisi = max(int(favori_sayisi * 0.1), 5)
+        toplam_satis = max(int(yorum_sayisi * 3.5), 10)
+        toplam_ciro = toplam_satis * fiyat
 
+        try:
             conn = get_db()
             cursor = conn.cursor()
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -183,8 +165,8 @@ def ekle():
             
             conn.commit()
             conn.close()
-    except Exception as e:
-        print("Ekleme Hatası:", e)
+        except Exception as db_err:
+            print("DB Kayıt Hatası:", db_err)
 
     return redirect(url_for('index'))
 
@@ -206,7 +188,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trendyol SaaS - Pazar Analiz Sistemi</title>
+    <title>Trendyol SaaS - Otomasyon Paneli</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -222,7 +204,7 @@ HTML_TEMPLATE = '''
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
             <span class="navbar-brand mb-0 h1"><i class="fa-solid fa-chart-line me-2"></i>Trendyol Akıllı Pazar Analiz Sistemi</span>
-            <span class="text-white small fw-bold"><i class="fa-solid fa-shield-halved me-1"></i>Proxy Bypass Aktif</span>
+            <span class="text-white small fw-bold"><i class="fa-solid fa-robot me-1"></i>Playwright Docker Otomasyonu Aktif</span>
         </div>
     </nav>
     <div class="container mb-5">
@@ -308,4 +290,4 @@ HTML_TEMPLATE = '''
 '''
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
