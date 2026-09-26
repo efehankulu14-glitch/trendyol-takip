@@ -7,7 +7,7 @@ from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 app = Flask(__name__)
 
@@ -76,8 +76,8 @@ def init_db():
 
 init_db()
 
-# --- URL'DEN BİLGİ VE ID AYRIŞTIRMA ---
-def url_den_isim_ve_id(raw_url):
+# --- URL BİLGİ VE ID YAKALAYICI ---
+def url_den_id_ve_isim(raw_url):
     try:
         parsed = urlparse(raw_url)
         path = parsed.path.strip('/')
@@ -101,40 +101,73 @@ def url_den_isim_ve_id(raw_url):
     except Exception:
         return None, "Trendyol Ürünü"
 
-# --- ZAMAN AŞIMINA DAYANIKLI SCRAPER ---
+# --- PROXY/API DESTEKLİ OTOMATİK SCRAPER ---
 def trendyol_veri_cek(raw_url):
     clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-    content_id, tahmini_isim = url_den_isim_ve_id(clean_url)
+    content_id, tahmini_isim = url_den_id_ve_isim(clean_url)
     
     urun_adi = tahmini_isim
     fiyat = 0.0
     stok = 0
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "tr-TR,tr;q=0.9"
-    }
+    # ScraperAPI Proxy servisi üzerinden istek atma (Datacenter engelini kırar)
+    SCRAPER_API_KEY = "3a033f67825b74104c86a3479a367469" # Ücretsiz Proxy API Key
+    target_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote(clean_url)}"
 
-    if content_id:
-        try:
-            api_url = f"https://public.trendyol.com/discovery-web-productgw-service/api/productDetail/{content_id}?storefrontId=1"
-            res = requests.get(api_url, headers=headers, timeout=2)
-            if res.status_code == 200:
-                data = res.json().get("result", {})
-                if data.get("name"):
-                    brand = data.get("brand", {}).get("name", "")
-                    urun_adi = f"{brand} {data.get('name')}".strip()
+    try:
+        res = requests.get(target_url, timeout=12)
+        if res.status_code == 200:
+            html = res.text
+            
+            # 1. State JSON Parse
+            match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html)
+            if match:
+                data = json.loads(match.group(1))
+                product = data.get("product", {})
                 
-                price_obj = data.get("price", {})
+                if product.get("name"):
+                    brand = product.get("brand", {}).get("name", "")
+                    urun_adi = f"{brand} {product.get('name')}".strip()
+                
+                price_obj = product.get("price", {})
                 fiyat = price_obj.get("discountedPrice", {}).get("value") or \
                         price_obj.get("sellingPrice", {}).get("value") or 0.0
                 
-                variants = data.get("variants", [])
+                variants = product.get("variants", [])
                 if variants:
                     stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
+
+            # 2. HTML Meta/Regex Parse (JSON Başarısız Olursa)
+            if fiyat == 0.0:
+                price_match = re.search(r'"sellingPrice":\s*\{\s*"value":\s*([\d\.]+)', html) or \
+                              re.search(r'"price":\s*([\d\.]+)', html) or \
+                              re.search(r'itemprop="price"\s+content="([\d\.]+)"', html)
+                if price_match:
+                    fiyat = float(price_match.group(1))
                 
-                return {"urun_adi": urun_adi[:70], "fiyat": float(fiyat), "stok": int(stok)}
+                if urun_adi == "Trendyol Ürünü":
+                    title_match = re.search(r'<title>(.*?)</title>', html)
+                    if title_match:
+                        urun_adi = title_match.group(1).split('|')[0].replace("- Trendyol", "").strip()
+
+    except Exception as e:
+        print(f"Scrape Hatası ({clean_url}): {e}")
+
+    # Eğe API yanıt vermezse doğrudan public API denemesi yap
+    if fiyat == 0.0 and content_id:
+        try:
+            public_api = f"https://public.trendyol.com/discovery-web-productgw-service/api/productDetail/{content_id}?storefrontId=1"
+            res_pub = requests.get(public_api, timeout=3)
+            if res_pub.status_code == 200:
+                data_pub = res_pub.json().get("result", {})
+                if data_pub.get("name"):
+                    brand = data_pub.get("brand", {}).get("name", "")
+                    urun_adi = f"{brand} {data_pub.get('name')}".strip()
+                price_obj = data_pub.get("price", {})
+                fiyat = price_obj.get("discountedPrice", {}).get("value") or price_obj.get("sellingPrice", {}).get("value") or 0.0
+                variants = data_pub.get("variants", [])
+                if variants:
+                    stok = sum([v.get("stock", 0) for v in variants if isinstance(v.get("stock"), (int, float))])
         except Exception:
             pass
 
@@ -144,7 +177,7 @@ def trendyol_veri_cek(raw_url):
         "stok": int(stok) if stok else 0
     }
 
-# --- PAZAR ANALİZİ ENGINE ---
+# --- PAZAR ANALİZİ ALGORİTMASI ---
 def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
     fiyat = fiyat or 0.0
     toplam_satis = toplam_satis or 0
@@ -195,7 +228,7 @@ def pazar_analizi_hesapla(toplam_satis, fiyat, stok):
         "trend_renk": trend_renk
     }
 
-# --- HTML ARAYÜZÜ ---
+# --- ARAYÜZ (HTML) ---
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="tr">
@@ -223,26 +256,18 @@ HTML_TEMPLATE = '''
     </nav>
 
     <div class="container mb-5">
-        <!-- HİBRİT EKLEME FORMU -->
         <div class="card p-4 mb-4">
             <h5 class="card-title fw-bold text-secondary mb-3"><i class="fa-solid fa-plus-circle me-2"></i>Takibe & Analize Yeni Ürün Ekle</h5>
-            <form action="/ekle" method="POST" class="row g-2">
-                <div class="col-md-6">
-                    <input type="url" name="url" class="form-control" placeholder="Trendyol Linki (https://...)" required>
+            <form action="/ekle" method="POST" class="row g-3">
+                <div class="col-md-10">
+                    <input type="url" name="url" class="form-control form-control-lg" placeholder="https://www.trendyol.com/..." required>
                 </div>
                 <div class="col-md-2">
-                    <input type="number" step="0.01" name="fiyat" class="form-control" placeholder="Başlangıç Fiyatı (TL)">
-                </div>
-                <div class="col-md-2">
-                    <input type="number" name="stok" class="form-control" placeholder="Mevcut Stok">
-                </div>
-                <div class="col-md-2">
-                    <button type="submit" class="btn btn-warning text-white w-100 fw-bold" style="background-color: #f27a1a;">Takibe Al</button>
+                    <button type="submit" class="btn btn-warning btn-lg text-white w-100 fw-bold" style="background-color: #f27a1a;">Takibe Al</button>
                 </div>
             </form>
         </div>
 
-        <!-- ÜRÜN LİSTESİ -->
         <h4 class="fw-bold mb-3 text-dark"><i class="fa-solid fa-chart-line me-2"></i>Takip Edilen Ürünler ve Pazar Analizi</h4>
         
         {% if urunler %}
@@ -341,20 +366,11 @@ def index():
 def ekle():
     try:
         raw_url = request.form.get('url', '').strip()
-        fiyat_input = request.form.get('fiyat', '').strip()
-        stok_input = request.form.get('stok', '').strip()
-
         if raw_url:
             clean_url = raw_url.split('?')[0] if '?' in raw_url else raw_url
-            _, tahmini_isim = url_den_isim_ve_id(clean_url)
             
-            # Otomatik Scraper Denemesi
+            # Otomatik Veri Çekme
             scraped = trendyol_veri_cek(clean_url)
-            
-            # Öncelik Kullanıcı Girdisi, yoksa Scraped Değer
-            final_fiyat = float(fiyat_input) if fiyat_input else scraped['fiyat']
-            final_stok = int(stok_input) if stok_input else scraped['stok']
-            final_isim = scraped['urun_adi'] if scraped['urun_adi'] != "Trendyol Ürünü" else tahmini_isim
             
             conn = get_db()
             cursor = conn.cursor()
@@ -368,7 +384,7 @@ def ekle():
                     fiyat=CASE WHEN excluded.fiyat > 0 THEN excluded.fiyat ELSE urunler.fiyat END,
                     son_stok=CASE WHEN excluded.son_stok > 0 THEN excluded.son_stok ELSE urunler.son_stok END,
                     son_guncelleme=excluded.son_guncelleme
-            ''', (clean_url, final_isim, final_fiyat, final_stok, now))
+            ''', (clean_url, scraped['urun_adi'], scraped['fiyat'], scraped['stok'], now))
             
             conn.commit()
             conn.close()
