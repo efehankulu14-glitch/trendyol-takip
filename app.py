@@ -2,16 +2,12 @@ from flask import Flask, render_template_string, request, redirect, url_for
 import sqlite3
 import re
 import json
+import requests
 from datetime import datetime
-
-try:
-    import cloudscraper
-    HAS_CLOUDSCRAPER = True
-except ImportError:
-    HAS_CLOUDSCRAPER = False
+from urllib.parse import quote
 
 app = Flask(__name__)
-DB_NAME = 'trendyol_takip_v9.db'
+DB_NAME = 'trendyol_takip_v10.db'
 
 def get_db():
     conn = sqlite3.connect(DB_NAME)
@@ -45,48 +41,71 @@ def init_db():
 init_db()
 
 def fetch_trendyol_product_data(product_url):
-    if not HAS_CLOUDSCRAPER:
-        return {"success": False, "error": "cloudscraper kütüphanesi yüklü değil"}
+    clean_url = product_url.split('?')[0] if '?' in product_url else product_url
     
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "tr-TR,tr;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+    
+    html_content = ""
+    success = False
+    error_msg = ""
+
+    # 1. Adım: Doğrudan istek atmayı dene
     try:
-        # Sadece 'chrome' veya 'firefox' geçerlidir, hatayı çözen kısım burasıdır
-        scraper = cloudscraper.create_scraper(
-            browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        }
-        
-        clean_url = product_url.split('?')[0] if '?' in product_url else product_url
-        response = scraper.get(clean_url, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            return {"success": False, "error": f"HTTP Kod: {response.status_code}"}
-        
-        match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', response.text, re.DOTALL)
-        if match:
-            data = json.loads(match.group(1))
-            product = data.get('product', {})
-            
-            title = product.get('name', 'Trendyol Ürünü')
-            price_info = product.get('price', {})
-            price = price_info.get('sellingPrice', {}).get('value') or price_info.get('discountedPrice', {}).get('value') or 0.0
-            
-            rating_count = product.get('ratingCount', 0)
-            favorite_count = product.get('favoriteCount', 0)
-            
-            return {
-                "success": True,
-                "title": title,
-                "price": float(price),
-                "ratingCount": int(rating_count),
-                "favoriteCount": int(favorite_count)
-            }
-        return {"success": False, "error": "Ürün JSON state verisi bulunamadı"}
+        resp = requests.get(clean_url, headers=headers, timeout=10)
+        if resp.status_code == 200 and "window.__PRODUCT_DETAIL_APP_INITIAL_STATE__" in resp.text:
+            html_content = resp.text
+            success = True
+        else:
+            error_msg = f"Doğrudan HTTP {resp.status_code}"
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        error_msg = str(e)
+
+    # 2. Adım: Doğrudan 403 veya hata yerse, proxy köprüsü üzerinden geç (Render engelini aşmak için)
+    if not success:
+        try:
+            proxy_api = f"https://api.allorigins.win/raw?url={quote(clean_url)}"
+            resp = requests.get(proxy_api, timeout=15)
+            if resp.status_code == 200 and "window.__PRODUCT_DETAIL_APP_INITIAL_STATE__" in resp.text:
+                html_content = resp.text
+                success = True
+                error_msg = "Proxy ile Canlı Çekildi"
+            else:
+                error_msg = f"Proxy HTTP {resp.status_code}"
+        except Exception as e:
+            error_msg = f"Proxy Hatası: {e}"
+
+    if success and html_content:
+        match = re.search(r'window\.__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});', html_content, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                product = data.get('product', {})
+                
+                title = product.get('name', 'Trendyol Ürünü')
+                price_info = product.get('price', {})
+                price = price_info.get('sellingPrice', {}).get('value') or price_info.get('discountedPrice', {}).get('value') or 0.0
+                
+                rating_count = int(product.get('ratingCount', 0))
+                favorite_count = int(product.get('favoriteCount', 0))
+                
+                return {
+                    "success": True,
+                    "title": title,
+                    "price": float(price),
+                    "ratingCount": rating_count,
+                    "favoriteCount": favorite_count,
+                    "msg": "Canlı Gerçek Veri Çekildi ✅"
+                }
+            except Exception as parse_err:
+                return {"success": False, "error": f"JSON Parse: {parse_err}"}
+                
+        return {"success": False, "error": "JSON state bulunamadı"}
+    
+    return {"success": False, "error": error_msg}
 
 @app.route('/')
 def index():
@@ -107,10 +126,10 @@ def index():
         u['analiz'] = {
             "aylik_satis": toplam_satis,
             "aylik_ciro": toplam_ciro,
-            "risk_skoru": 35 if yorum_sayisi > 200 else 60,
-            "risk_etiketi": "Yüksek Talep / Fırsat" if yorum_sayisi > 200 else "Normal",
-            "risk_renk": "#27ae60" if yorum_sayisi > 200 else "#f39c12",
-            "trend": "🔥 Çok Satan" if yorum_sayisi > 200 else "🚀 Artışta",
+            "risk_skoru": 35 if yorum_sayisi > 100 else 60,
+            "risk_etiketi": "Yüksek Talep / Fırsat" if yorum_sayisi > 100 else "Normal",
+            "risk_renk": "#27ae60" if yorum_sayisi > 100 else "#f39c12",
+            "trend": "🔥 Çok Satan" if yorum_sayisi > 100 else "🚀 Artışta",
             "trend_renk": "#27ae60"
         }
         urunler.append(u)
@@ -131,16 +150,16 @@ def ekle():
                 fiyat = res["price"]
                 yorum_sayisi = res["ratingCount"]
                 favori_sayisi = res["favoriteCount"]
-                pazar_mesaji = "Trendyol'dan Canlı Çekildi"
+                pazar_mesaji = res["msg"]
             else:
-                urun_adi = "Trendyol Ürünü"
-                fiyat = 118.00
-                yorum_sayisi = 211
-                favori_sayisi = 2758
+                urun_adi = "Trendyol Ürünü (Hata)"
+                fiyat = 0.0
+                yorum_sayisi = 0
+                favori_sayisi = 0
                 pazar_mesaji = f"Hata: {res.get('error', 'Bilinmeyen')}"
 
-            sepet_sayisi = max(int(favori_sayisi * 0.1), 15)
-            toplam_satis = max(int(yorum_sayisi * 3.5), 20)
+            sepet_sayisi = max(int(favori_sayisi * 0.1), 5)
+            toplam_satis = max(int(yorum_sayisi * 3.5), 10)
             toplam_ciro = toplam_satis * fiyat
 
             conn = get_db()
@@ -203,7 +222,7 @@ HTML_TEMPLATE = '''
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
             <span class="navbar-brand mb-0 h1"><i class="fa-solid fa-chart-line me-2"></i>Trendyol Akıllı Pazar Analiz Sistemi</span>
-            <span class="text-white small fw-bold"><i class="fa-solid fa-bolt me-1"></i>Chrome Bypass Aktif</span>
+            <span class="text-white small fw-bold"><i class="fa-solid fa-shield-halved me-1"></i>Proxy Bypass Aktif</span>
         </div>
     </nav>
     <div class="container mb-5">
